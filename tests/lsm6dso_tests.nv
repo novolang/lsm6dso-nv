@@ -1,0 +1,1637 @@
+// lsm6dso_tests — the driver over a double of the part: a register file
+// that answers on an I2C bus and on an SPI bus the way ST's data sheet
+// (DS12140 Rev 3, §§ 5.1 and 9) says an LSM6DSO does, so the control byte,
+// the address increment, WHO_AM_I, every conversion, the rates and power
+// modes, the FIFO, the self-tests and the bring-up are checked on the
+// host, one transaction at a time.  The log keeps what the controller sent,
+// in a form the tests compare.
+//
+// Log entries: an I2C write is 1, the address, the bytes sent, -1; an I2C
+// read is 2, the address, the register, the count, -1; an SPI
+// transaction is 3, the bytes the controller clocked out, -1.
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_gyro.{ GyroMilliDps, GyroRange, Gyroscope }
+use dev_imu.{ ImuSample, Imu }
+use dev_thermo.{ TempMilliC, Thermometer }
+use dev_id.{ DeviceId, Identifiable }
+use lsm6dso
+use lsm6dso.{ Lsm6dso, Lsm6dsoSpi, Lsm6dsoMode, Lsm6dsoPort }
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `regs` is the part's registers.  `st` is the double's state: 0 is 0
+// before an SPI control byte and 1 after it, 1 the register, 2 R/W, 4 1
+// when a part is there, 9 1 inside an SPI transaction, 10 the number of
+// FIFO words taken, 20 and 21 the SPI clock and mode, 22 the I2C clock, 30
+// to 32 the counts the accelerometer's self-test adds to X, Y and Z, 33 to
+// 35 the gyroscope's, 41 and 42 the XLDA and GDA flags, 43 1 when both are
+// set whenever STATUS_REG is read, 44 and 45 the grants of that when 45 is
+// 1, 60 the reads of CTRL3_C that still show SW_RESET set, 66 the reads a
+// reset leaves, 67 1 to keep no log, 70 the I2C address, 98 the bytes in the
+// FIFO and 99 the entries in the log.  `ro` lists registers that ignore a
+// write.  `fifo` holds the FIFO's words as seven bytes each, and `log` the
+// log.  Everything is kept in maps, which a method changes through its
+// receiver.
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    ro: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+    fifo: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// The registers as a reset leaves them: WHO_AM_I, PIN_CTRL 0x3F, CTRL3_C
+// with IF_INC and CTRL9_XL with its DEN bits set, the rest 0.
+fn defaults(c: Chip)
+    for r in 0..128
+        c.regs.insert(r, 0)
+    c.regs.insert(0x02, 0x3F)
+    c.regs.insert(0x0F, 0x6C)
+    c.regs.insert(0x12, 0x04)
+    c.regs.insert(0x18, 0xE0)
+
+// The chip with its reset values in place.
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(), st: HashMap.new(), ro: HashMap.new(), log: HashMap.new(), fifo: HashMap.new() }
+    defaults(c)
+    c.st.insert(4, 1)
+    c.st.insert(66, 2)
+    c.st.insert(70, 0x6A)
+    c
+
+// Appends a value to the log, unless the test keeps none.
+fn log_push(c: Chip, v: Int)
+    if at(c.st, 67) == 1
+        return
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+// Empties the log.
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// Whether a multiple-byte transfer advances the address: IF_INC.
+fn inc_of(c: Chip) -> Int
+    if (at(c.regs, 0x12) & 0x04) != 0
+        return 1
+    0
+
+// The FIFO is on in any mode but bypass.
+fn fifo_on(c: Chip) -> Bool
+    (at(c.regs, 0x0A) & 0x07) != 0
+
+// The FIFO words that have not been taken.
+fn fifo_left(c: Chip) -> Int
+    at(c.st, 98) / 7 - at(c.st, 10)
+
+// The self-test's push for a gyroscope or accelerometer axis: the part's
+// amount, positive or negative by the ST field of CTRL5_C.
+fn st_push(c: Chip, reg: Int) -> Int
+    let c5 = at(c.regs, 0x14)
+    if reg >= 0x28
+        let axis = (reg - 0x28) / 2
+        let f = c5 & 0x03
+        if f == 1
+            return at(c.st, 30 + axis)
+        if f == 2
+            return 0 - at(c.st, 30 + axis)
+        return 0
+    let axis = (reg - 0x22) / 2
+    let f = (c5 >> 2) & 0x03
+    if f == 1
+        return at(c.st, 33 + axis)
+    if f == 3
+        return 0 - at(c.st, 33 + axis)
+    0
+
+// An output register 0x22 to 0x2D: the stored count plus the self-test's
+// push, one byte of it.  Reading clears the new-data flag of its sensor.
+fn out_read(c: Chip, reg: Int) -> Int
+    if reg >= 0x28
+        c.st.insert(41, 0)
+    else
+        c.st.insert(42, 0)
+    var lo = 0x22 + ((reg - 0x22) / 2) * 2
+    let v = (at(c.regs, lo) | (at(c.regs, lo + 1) << 8)) + st_push(c, reg)
+    if (reg - 0x22) % 2 == 0
+        return v & 0xFF
+    (v >> 8) & 0xFF
+
+// STATUS_REG as the part answers it.
+fn status_read(c: Chip) -> Int
+    if at(c.st, 43) == 1
+        if at(c.st, 45) == 0
+            c.st.insert(41, 1)
+            c.st.insert(42, 1)
+        elif at(c.st, 44) > 0
+            c.st.insert(44, at(c.st, 44) - 1)
+            c.st.insert(41, 1)
+            c.st.insert(42, 1)
+    var v = 0
+    if at(c.st, 41) == 1
+        v = v | 0x01
+    if at(c.st, 42) == 1
+        v = v | 0x02
+    v
+
+// Whether FUNC_CFG_ACCESS selects an embedded-function or sensor-hub
+// bank, in which the registers other than FUNC_CFG_ACCESS are other
+// registers (§ 9.1).  The double answers 0 for them and ignores writes.
+fn in_other_bank(c: Chip, reg: Int) -> Bool
+    reg != 0x01 and (at(c.regs, 0x01) & 0xC0) != 0
+
+// A register as the part answers it.
+fn chip_read(c: Chip, reg: Int) -> Int
+    if in_other_bank(c, reg)
+        return 0
+    if reg == 0x12
+        let v = at(c.regs, 0x12)
+        if at(c.st, 60) > 0
+            c.st.insert(60, at(c.st, 60) - 1)
+            return v | 0x01
+        return v
+    if reg == 0x1E
+        return status_read(c)
+    if reg >= 0x22 and reg <= 0x2D
+        return out_read(c, reg)
+    if reg == 0x3A
+        return fifo_left(c) & 0xFF
+    if reg == 0x3B
+        return (fifo_left(c) >> 8) & 0x03
+    if reg >= 0x78 and reg <= 0x7E
+        if not fifo_on(c) or fifo_left(c) <= 0
+            return 0
+        let k = at(c.st, 10) * 7 + (reg - 0x78)
+        let v = at(c.fifo, k)
+        if reg == 0x7E
+            c.st.insert(10, at(c.st, 10) + 1)
+        return v
+    at(c.regs, reg)
+
+// A write to a register, which a read-only one ignores.  SW_RESET puts the
+// registers back to their defaults; bypass mode empties the FIFO.
+fn chip_write(c: Chip, reg: Int, v: Int)
+    if at(c.ro, reg) == 1 or in_other_bank(c, reg)
+        return
+    if reg == 0x12 and (v & 0x01) != 0
+        defaults(c)
+        c.st.insert(60, at(c.st, 66))
+        c.st.insert(10, at(c.st, 98) / 7)
+        return
+    c.regs.insert(reg, v & 0xFF)
+    if reg == 0x0A and (v & 0x07) == 0
+        c.st.insert(10, at(c.st, 98) / 7)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(22, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        log_push(self.c, 1)
+        log_push(self.c, addr)
+        for b in data
+            log_push(self.c, b as Int)
+        log_push(self.c, -1)
+        if addr != at(self.c.st, 70) or at(self.c.st, 4) == 0 or data.len() < 2
+            return false
+        var r = data[0] as Int
+        let inc = inc_of(self.c)
+        for i in 1..data.len()
+            chip_write(self.c, r, data[i] as Int)
+            r = r + inc
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        log_push(self.c, 2)
+        log_push(self.c, addr)
+        log_push(self.c, tx[0] as Int)
+        log_push(self.c, n)
+        log_push(self.c, -1)
+        if addr != at(self.c.st, 70) or at(self.c.st, 4) == 0
+            return None
+        var r = tx[0] as Int
+        let inc = inc_of(self.c)
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, chip_read(self.c, r) as u8)
+            r = r + inc
+        Some(out)
+
+struct FakeSpi
+    c: Chip
+
+impl SpiBus for FakeSpi
+    fn init(self, freq: Int, mode: Int) [hw]
+        self.c.st.insert(20, freq)
+        self.c.st.insert(21, mode)
+
+    fn transfer(self, b: Int) -> Int [hw]
+        if at(self.c.st, 9) == 1
+            log_push(self.c, b)
+        if at(self.c.st, 4) == 0
+            return 0xFF
+        if at(self.c.st, 0) == 0
+            self.c.st.insert(0, 1)
+            self.c.st.insert(1, b & 0x7F)
+            self.c.st.insert(2, (b >> 7) & 1)
+            return 0xFF
+        let r = at(self.c.st, 1)
+        self.c.st.insert(1, (r + inc_of(self.c)) & 0x7F)
+        if at(self.c.st, 2) == 1
+            return chip_read(self.c, r)
+        chip_write(self.c, r, b)
+        0xFF
+
+    fn write(self, data: [u8]) [hw]
+        for b in data
+            let _ = self.transfer(b as Int)
+
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, self.transfer(0xFF) as u8)
+        out
+
+// The GPIO double: the chip select (pin 67) falling starts an SPI
+// transaction and rising ends it.
+struct FakePins
+    c: Chip
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+        if pin == 67 and val == 0
+            self.c.st.insert(0, 0)
+            self.c.st.insert(9, 1)
+            log_push(self.c, 3)
+        if pin == 67 and val == 1 and at(self.c.st, 9) == 1
+            self.c.st.insert(9, 0)
+            log_push(self.c, -1)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+fn pins(c: Chip) -> FakePins
+    FakePins { c: c, levels: HashMap.new(), modes: HashMap.new() }
+
+// The two ports, as a type that holds a bus implements them: every method
+// is the package's own function over the double.
+struct I2cDut
+    bus: FakeI2c
+    pins: FakePins
+    w: DeviceWiring
+
+impl Lsm6dsoPort for I2cDut
+    fn setup(self) -> Bool [hw]
+        lsm6dso.i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        lsm6dso.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        lsm6dso.i2c_write(self.bus, self.w, reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        lsm6dso.irq_level_of(self.pins, self.w)
+
+    fn on_spi(self) -> Bool [hw]
+        false
+
+struct SpiDut
+    bus: FakeSpi
+    pins: FakePins
+    w: DeviceWiring
+
+impl Lsm6dsoPort for SpiDut
+    fn setup(self) -> Bool [hw]
+        lsm6dso.spi_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        lsm6dso.spi_read_into(self.bus, self.pins, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        lsm6dso.spi_write(self.bus, self.pins, self.w, reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        lsm6dso.irq_level_of(self.pins, self.w)
+
+    fn on_spi(self) -> Bool [hw]
+        true
+
+// A port that refuses one chosen write or one chosen read of a chosen
+// register: `fail` maps a register to the number of the write, counted from
+// 1, that the bus refuses, and `seen` counts the writes; `rfail` and
+// `rseen` do the same for reads.  `quiet` limits the reads of the FIFO's
+// seven data registers to the number in key 0 once key 1 is 1.  It reaches
+// the refusals that a read-only register cannot, such as the second write
+// of a register.
+struct Flaky
+    inner: I2cDut
+    fail: HashMap<Int, Int>
+    seen: HashMap<Int, Int>
+    rfail: HashMap<Int, Int>
+    rseen: HashMap<Int, Int>
+    quiet: HashMap<Int, Int>
+
+impl Lsm6dsoPort for Flaky
+    fn setup(self) -> Bool [hw]
+        self.inner.setup()
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        let k = at(self.rseen, reg) + 1
+        self.rseen.insert(reg, k)
+        if at(self.rfail, reg) == k
+            dst.clear()
+            return false
+        if reg == 0x78 and at(self.quiet, 1) == 1
+            if at(self.quiet, 0) == 0
+                dst.clear()
+                return false
+            self.quiet.insert(0, at(self.quiet, 0) - 1)
+        self.inner.read_regs(reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        let n = at(self.seen, reg) + 1
+        self.seen.insert(reg, n)
+        if at(self.fail, reg) == n
+            return false
+        self.inner.write_reg(reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        self.inner.irq_level()
+
+    fn on_spi(self) -> Bool [hw]
+        self.inner.on_spi()
+
+fn flaky(c: Chip) -> Flaky
+    Flaky { inner: i2c_dut(c), fail: HashMap.new(), seen: HashMap.new(), rfail: HashMap.new(), rseen: HashMap.new(), quiet: HashMap.new() }
+
+fn flaky_write(c: Chip, reg: Int, nth: Int) -> Flaky
+    let f = flaky(c)
+    f.fail.insert(reg, nth)
+    f
+
+fn flaky_read(c: Chip, reg: Int, nth: Int) -> Flaky
+    let f = flaky(c)
+    f.rfail.insert(reg, nth)
+    f
+
+// The board's wiring: the part at 0x6A on I2C, INT1 on pin 65.
+fn i2c_wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x6A), 65)
+
+// The part on SPI: chip select on pin 67, INT1 on pin 65.
+fn spi_wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_spi(0, 67), 65)
+
+fn i2c_dut(c: Chip) -> I2cDut
+    I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: i2c_wiring() }
+
+fn spi_dut(c: Chip) -> SpiDut
+    SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: spi_wiring() }
+
+// Asserts the log holds exactly `want`, then empties it.
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+fn reg_of(c: Chip, r: Int) -> Int
+    at(c.regs, r)
+
+// Sets the 16-bit count of an axis, low byte first, at `reg`.
+fn put16(c: Chip, reg: Int, v: Int)
+    let u = v & 0xFFFF
+    c.regs.insert(reg, u & 0xFF)
+    c.regs.insert(reg + 1, u >> 8)
+
+// Sets the gyroscope's three axes, then the accelerometer's.
+fn put_gyro(c: Chip, x: Int, y: Int, z: Int)
+    put16(c, 0x22, x)
+    put16(c, 0x24, y)
+    put16(c, 0x26, z)
+
+fn put_accel(c: Chip, x: Int, y: Int, z: Int)
+    put16(c, 0x28, x)
+    put16(c, 0x2A, y)
+    put16(c, 0x2C, z)
+
+// Appends a FIFO word: the sensor tag in the top five bits of the tag
+// byte, then three 16-bit counts.
+fn fifo_word(c: Chip, tag: Int, x: Int, y: Int, z: Int)
+    let n = at(c.st, 98)
+    c.fifo.insert(n, tag << 3)
+    var k = 1
+    for v in [x, y, z]
+        let u = v & 0xFFFF
+        c.fifo.insert(n + k, u & 0xFF)
+        c.fifo.insert(n + k + 1, u >> 8)
+        k = k + 2
+    c.st.insert(98, n + 7)
+
+fn x_of(o: ?AccelMilliG) -> Int
+    match o
+        Some(a) => a.x
+        None    => -99999
+
+fn y_of(o: ?AccelMilliG) -> Int
+    match o
+        Some(a) => a.y
+        None    => -99999
+
+fn z_of(o: ?AccelMilliG) -> Int
+    match o
+        Some(a) => a.z
+        None    => -99999
+
+fn gx_of(o: ?GyroMilliDps) -> Int
+    match o
+        Some(g) => g.x
+        None    => -99999
+
+fn gy_of(o: ?GyroMilliDps) -> Int
+    match o
+        Some(g) => g.y
+        None    => -99999
+
+fn gz_of(o: ?GyroMilliDps) -> Int
+    match o
+        Some(g) => g.z
+        None    => -99999
+
+// The log of an SPI read: the control byte, then `n` bytes of 0xFF, which
+// is what the controller clocks out while it reads.
+fn spi_read_log(cmd: Int, n: Int) -> [Int]
+    var out: [Int] = [3, cmd]
+    for _i in 0..n
+        list.push(out, 0xFF)
+    list.push(out, -1)
+    out
+
+// ── The two buses' framing ───────────────────────────────────────────
+
+@test
+fn test_an_i2c_read_is_the_register_and_a_repeated_start_for_any_count() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(lsm6dso.reg_read(d, 0x0F) ?? -1, 0x6C)
+    log_is(c, [2, 0x6A, 0x0F, 1, -1])
+    c.regs.insert(0x20, 11)
+    c.regs.insert(0x21, 22)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x20, 2, var b))
+    log_is(c, [2, 0x6A, 0x20, 2, -1])
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 22)
+
+@test
+fn test_an_i2c_write_is_the_register_then_the_byte() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(d.write_reg(0x10, 0x40))
+    log_is(c, [1, 0x6A, 0x10, 0x40, -1])
+    test.assert_eq(reg_of(c, 0x10), 0x40)
+
+@test
+fn test_a_missing_i2c_part_does_not_answer() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(lsm6dso.reg_read(d, 0x0F) == None)
+    test.assert(not d.write_reg(0x10, 1))
+    test.assert(not lsm6dso.reg_write(d, 0x10, 1))
+    test.assert(not lsm6dso.reg_update(d, 0x10, 1, 1))
+    test.assert(lsm6dso.id_read(d) == None)
+
+@test
+fn test_an_spi_read_sets_rw_and_carries_no_dummy_byte() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert_eq(lsm6dso.reg_read(d, 0x0F) ?? -1, 0x6C)
+    log_is(c, [3, 0x8F, 0xFF, -1])
+    test.assert_eq(at(d.pins.levels, 67), 1)
+    c.regs.insert(0x20, 11)
+    c.regs.insert(0x21, 22)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x20, 2, var b))
+    log_is(c, [3, 0xA0, 0xFF, 0xFF, -1])
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 22)
+
+@test
+fn test_an_spi_write_clears_rw() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(d.write_reg(0x10, 0x40))
+    log_is(c, [3, 0x10, 0x40, -1])
+    test.assert_eq(reg_of(c, 0x10), 0x40)
+
+@test
+fn test_an_spi_part_that_is_not_there_reads_0xff_and_is_no_part() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = spi_dut(c)
+    test.assert_eq(lsm6dso.reg_read(d, 0x0F) ?? -1, 0xFF)
+    test.assert(lsm6dso.id_read(d) == None)
+    c.st.insert(4, 1)
+    c.regs.insert(0x0F, 0)
+    test.assert(lsm6dso.id_read(d) == None)
+
+@test
+fn test_a_wiring_with_no_chip_select_runs_no_spi_transaction() [io, hw]
+    let c = chip()
+    let d = SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: dev_bus.wiring_i2c(0, 0x6A) }
+    var b: DevBytes = Vec.new()
+    test.assert(not d.read_regs(0x0F, 1, var b))
+    test.assert(not d.write_reg(0x10, 1))
+    test.assert(not d.setup())
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_a_wiring_with_no_address_is_not_an_i2c_part() [io, hw]
+    let c = chip()
+    let d = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: dev_bus.wiring_spi(0, 67) }
+    test.assert(not d.setup())
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_a_multiple_byte_read_repeats_one_register_while_if_inc_is_clear() [io, hw]
+    // The pitfall IF_INC is: with the bit clear, every byte of a burst is
+    // the first register, on both buses.
+    let c = chip()
+    c.regs.insert(0x12, 0x00)
+    c.regs.insert(0x20, 11)
+    c.regs.insert(0x21, 22)
+    var b: DevBytes = Vec.new()
+    test.assert(i2c_dut(c).read_regs(0x20, 2, var b))
+    test.assert_eq(b[1] as Int, 11)
+    test.assert(spi_dut(c).read_regs(0x20, 2, var b))
+    test.assert_eq(b[1] as Int, 11)
+
+// ── Setup ────────────────────────────────────────────────────────────
+
+@test
+fn test_i2c_setup_makes_the_interrupt_pin_an_input_and_the_bus_fast() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(c.st, 22), 400000)
+    test.assert_eq(at(d.pins.modes, 65), 0)
+
+@test
+fn test_spi_setup_drives_chip_select_high_before_it_is_an_output() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(d.pins.levels, 67), 1)
+    test.assert_eq(at(d.pins.modes, 67), 1)
+    test.assert_eq(at(d.pins.modes, 65), 0)
+    test.assert_eq(at(c.st, 20), 4000000)
+    test.assert_eq(at(c.st, 21), 3)
+
+@test
+fn test_the_interrupt_line_level() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    d.pins.levels.insert(65, 1)
+    test.assert_eq(d.irq_level(), 1)
+    test.assert_eq(lsm6dso.irq_level_of(d.pins, dev_bus.wiring_i2c(0, 0x6A)), -1)
+    let s = spi_dut(c)
+    s.pins.levels.insert(65, 1)
+    test.assert_eq(s.irq_level(), 1)
+
+// ── Identity ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_identity_is_who_am_i_on_both_buses() [io, hw]
+    let c = chip()
+    match lsm6dso.id_read(i2c_dut(c))
+        Some(id) =>
+            test.assert_eq(id.who, 0x6C)
+            test.assert(id.rev == None)
+        None => test.assert(false)
+    match lsm6dso.id_read(spi_dut(c))
+        Some(id) => test.assert_eq(id.who, 0x6C)
+        None     => test.assert(false)
+
+// ── Ranges and steps ─────────────────────────────────────────────────
+
+@test
+fn test_the_accelerometer_range_codes_are_not_in_ascending_order() [io, hw]
+    // Table 45, XL_FS_MODE clear: 00 ±2 g, 01 ±16 g, 10 ±4 g, 11 ±8 g.
+    test.assert(lsm6dso.accel_range_of(0x00) == AccelRange2g)
+    test.assert(lsm6dso.accel_range_of(0x04) == AccelRange16g)
+    test.assert(lsm6dso.accel_range_of(0x08) == AccelRange4g)
+    test.assert(lsm6dso.accel_range_of(0x0C) == AccelRange8g)
+    // The other bits of CTRL1_XL do not matter.
+    test.assert(lsm6dso.accel_range_of(0x4F) == AccelRange8g)
+    test.assert_eq(lsm6dso.accel_fs_of(AccelRange2g), 0)
+    test.assert_eq(lsm6dso.accel_fs_of(AccelRange16g), 1)
+    test.assert_eq(lsm6dso.accel_fs_of(AccelRange4g), 2)
+    test.assert_eq(lsm6dso.accel_fs_of(AccelRange8g), 3)
+
+@test
+fn test_the_gyroscope_range_codes_and_the_125_dps_bit() [io, hw]
+    test.assert(lsm6dso.gyro_range_of(0x00) == GyroRange250dps)
+    test.assert(lsm6dso.gyro_range_of(0x04) == GyroRange500dps)
+    test.assert(lsm6dso.gyro_range_of(0x08) == GyroRange1000dps)
+    test.assert(lsm6dso.gyro_range_of(0x0C) == GyroRange2000dps)
+    test.assert_eq(lsm6dso.gyro_fs_of(GyroRange250dps), 0)
+    test.assert_eq(lsm6dso.gyro_fs_of(GyroRange500dps), 1)
+    test.assert_eq(lsm6dso.gyro_fs_of(GyroRange1000dps), 2)
+    test.assert_eq(lsm6dso.gyro_fs_of(GyroRange2000dps), 3)
+    // FS_125 set: ±125 dps, which the trait reports as its narrowest.
+    test.assert(lsm6dso.gyro_range_of(0x02) == GyroRange250dps)
+
+@test
+fn test_the_steps_are_table_2s() [io, hw]
+    test.assert_eq(lsm6dso.ug_per_count(0x00), 61)
+    test.assert_eq(lsm6dso.ug_per_count(0x08), 122)
+    test.assert_eq(lsm6dso.ug_per_count(0x0C), 244)
+    test.assert_eq(lsm6dso.ug_per_count(0x04), 488)
+    test.assert_eq(lsm6dso.udps_per_count(0x00), 8750)
+    test.assert_eq(lsm6dso.udps_per_count(0x04), 17500)
+    test.assert_eq(lsm6dso.udps_per_count(0x08), 35000)
+    test.assert_eq(lsm6dso.udps_per_count(0x0C), 70000)
+    // ±125 dps is 4.375 mdps a count, and wins over the FS_G bits.
+    test.assert_eq(lsm6dso.udps_per_count(0x02), 4375)
+    test.assert_eq(lsm6dso.udps_per_count(0x0E), 4375)
+
+// ── Rates ────────────────────────────────────────────────────────────
+
+@test
+fn test_the_gyroscope_rate_codes_are_table_48s() [io, hw]
+    test.assert_eq(lsm6dso.g_mhz_of_code(0), 0)
+    test.assert_eq(lsm6dso.g_mhz_of_code(1), 12500)
+    test.assert_eq(lsm6dso.g_mhz_of_code(2), 26000)
+    test.assert_eq(lsm6dso.g_mhz_of_code(3), 52000)
+    test.assert_eq(lsm6dso.g_mhz_of_code(4), 104000)
+    test.assert_eq(lsm6dso.g_mhz_of_code(5), 208000)
+    test.assert_eq(lsm6dso.g_mhz_of_code(6), 416000)
+    test.assert_eq(lsm6dso.g_mhz_of_code(7), 833000)
+    test.assert_eq(lsm6dso.g_mhz_of_code(8), 1666000)
+    test.assert_eq(lsm6dso.g_mhz_of_code(9), 3332000)
+    test.assert_eq(lsm6dso.g_mhz_of_code(10), 6664000)
+    // 1011 and above are not rates of the gyroscope.
+    test.assert_eq(lsm6dso.g_mhz_of_code(11), 0)
+    test.assert_eq(lsm6dso.g_mhz_of_code(15), 0)
+
+@test
+fn test_accelerometer_code_1011_is_1_6_hz_in_low_power_mode_and_12_5_hz_otherwise() [io, hw]
+    test.assert_eq(lsm6dso.xl_mhz_of_code(11, true), 1600)
+    test.assert_eq(lsm6dso.xl_mhz_of_code(11, false), 12500)
+    test.assert_eq(lsm6dso.xl_mhz_of_code(1, true), 12500)
+    test.assert_eq(lsm6dso.xl_mhz_of_code(10, false), 6664000)
+    test.assert_eq(lsm6dso.xl_mhz_of_code(0, true), 0)
+    test.assert_eq(lsm6dso.xl_mhz_of_code(12, false), 0)
+
+@test
+fn test_a_requested_rate_rounds_up_to_a_code() [io, hw]
+    test.assert_eq(lsm6dso.odr_code_for(0, false), 0)
+    test.assert_eq(lsm6dso.odr_code_for(-5, true), 0)
+    test.assert_eq(lsm6dso.odr_code_for(1, false), 1)
+    test.assert_eq(lsm6dso.odr_code_for(12500, false), 1)
+    test.assert_eq(lsm6dso.odr_code_for(12501, false), 2)
+    test.assert_eq(lsm6dso.odr_code_for(100000, false), 4)
+    test.assert_eq(lsm6dso.odr_code_for(104000, false), 4)
+    test.assert_eq(lsm6dso.odr_code_for(6664000, false), 10)
+    test.assert_eq(lsm6dso.odr_code_for(9999999, false), 10)
+    // 1.6 Hz exists in low-power mode only.
+    test.assert_eq(lsm6dso.odr_code_for(1600, true), 11)
+    test.assert_eq(lsm6dso.odr_code_for(1600, false), 1)
+    test.assert_eq(lsm6dso.odr_code_for(1601, true), 1)
+
+@test
+fn test_a_rate_in_whole_hertz_is_rounded_and_zero_when_off() [io, hw]
+    test.assert_eq(lsm6dso.hz_of_mhz(0), 0)
+    test.assert_eq(lsm6dso.hz_of_mhz(-1), 0)
+    test.assert_eq(lsm6dso.hz_of_mhz(1600), 2)
+    test.assert_eq(lsm6dso.hz_of_mhz(12500), 13)
+    test.assert_eq(lsm6dso.hz_of_mhz(104000), 104)
+    test.assert_eq(lsm6dso.hz_of_mhz(6664000), 6664)
+
+// ── Samples ──────────────────────────────────────────────────────────
+
+@test
+fn test_an_acceleration_is_converted_at_each_range() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    put_accel(c, 1000, -2000, 10000)
+    // ±2 g: 61 ug a count.
+    test.assert_eq(x_of(lsm6dso.accel_read_of(d)), 61)
+    test.assert_eq(y_of(lsm6dso.accel_read_of(d)), -122)
+    test.assert_eq(z_of(lsm6dso.accel_read_of(d)), 610)
+    // ±4 g, ±8 g and ±16 g.
+    c.regs.insert(0x10, 0x08)
+    test.assert_eq(x_of(lsm6dso.accel_read_of(d)), 122)
+    c.regs.insert(0x10, 0x0C)
+    test.assert_eq(x_of(lsm6dso.accel_read_of(d)), 244)
+    c.regs.insert(0x10, 0x04)
+    test.assert_eq(x_of(lsm6dso.accel_read_of(d)), 488)
+    test.assert_eq(y_of(lsm6dso.accel_read_of(d)), -976)
+
+@test
+fn test_the_largest_counts_reach_the_full_scale() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    put_accel(c, 32767, -32768, 0)
+    c.regs.insert(0x10, 0x04)
+    test.assert_eq(x_of(lsm6dso.accel_read_of(d)), 15990)
+    test.assert_eq(y_of(lsm6dso.accel_read_of(d)), -15990)
+
+@test
+fn test_a_rate_of_turn_is_converted_at_each_range() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    put_gyro(c, 1000, -2000, 100)
+    test.assert_eq(gx_of(lsm6dso.gyro_read_of(d)), 8750)
+    test.assert_eq(gy_of(lsm6dso.gyro_read_of(d)), -17500)
+    test.assert_eq(gz_of(lsm6dso.gyro_read_of(d)), 875)
+    c.regs.insert(0x11, 0x04)
+    test.assert_eq(gx_of(lsm6dso.gyro_read_of(d)), 17500)
+    c.regs.insert(0x11, 0x08)
+    test.assert_eq(gx_of(lsm6dso.gyro_read_of(d)), 35000)
+    c.regs.insert(0x11, 0x0C)
+    test.assert_eq(gx_of(lsm6dso.gyro_read_of(d)), 70000)
+    c.regs.insert(0x11, 0x02)
+    test.assert_eq(gx_of(lsm6dso.gyro_read_of(d)), 4375)
+
+@test
+fn test_each_sample_is_the_ranges_then_one_burst_of_the_outputs() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    put_accel(c, 1000, 0, 0)
+    put_gyro(c, 1000, 0, 0)
+    log_clear(c)
+    let _a = lsm6dso.accel_read_of(d)
+    log_is(c, [2, 0x6A, 0x10, 2, -1, 2, 0x6A, 0x28, 6, -1])
+    let _g = lsm6dso.gyro_read_of(d)
+    log_is(c, [2, 0x6A, 0x10, 2, -1, 2, 0x6A, 0x22, 6, -1])
+    let _i = lsm6dso.imu_read_of(d)
+    log_is(c, [2, 0x6A, 0x10, 2, -1, 2, 0x6A, 0x22, 12, -1])
+
+@test
+fn test_a_paired_sample_has_both_from_one_burst_at_their_own_ranges() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    put_gyro(c, 1000, -1000, 0)
+    put_accel(c, 2000, 0, 1000)
+    // The accelerometer at ±4 g and the gyroscope at ±500 dps.
+    c.regs.insert(0x10, 0x08)
+    c.regs.insert(0x11, 0x04)
+    match lsm6dso.imu_read_of(d)
+        Some(s) =>
+            test.assert_eq(s.accel.x, 244)
+            test.assert_eq(s.accel.z, 122)
+            test.assert_eq(s.gyro.x, 17500)
+            test.assert_eq(s.gyro.y, -17500)
+        None => test.assert(false)
+
+@test
+fn test_a_sample_over_spi_is_the_same_burst() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    put_accel(c, 1000, 0, 0)
+    put_gyro(c, 1000, 0, 0)
+    log_clear(c)
+    test.assert_eq(x_of(lsm6dso.accel_read_of(d)), 61)
+    log_is(c, [3, 0x90, 0xFF, 0xFF, -1, 3, 0xA8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, -1])
+
+@test
+fn test_no_part_gives_no_sample_and_is_never_ready() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(lsm6dso.accel_read_of(d) == None)
+    test.assert(lsm6dso.gyro_read_of(d) == None)
+    test.assert(lsm6dso.imu_read_of(d) == None)
+    test.assert(not lsm6dso.accel_ready_of(d))
+    test.assert(not lsm6dso.gyro_ready_of(d))
+    test.assert(lsm6dso.temp_read_of(d) == None)
+    // A part that answers the ranges and then goes quiet.
+    let e = chip()
+    let f = flaky_read(e, 0x28, 1)
+    test.assert(lsm6dso.accel_read_of(f) == None)
+    let g = flaky_read(e, 0x22, 1)
+    test.assert(lsm6dso.gyro_read_of(g) == None)
+    let h = flaky_read(e, 0x22, 1)
+    test.assert(lsm6dso.imu_read_of(h) == None)
+
+@test
+fn test_ready_is_xlda_and_gda_of_status_reg_and_reading_the_outputs_clears_them() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(not lsm6dso.accel_ready_of(d))
+    test.assert(not lsm6dso.gyro_ready_of(d))
+    c.st.insert(41, 1)
+    test.assert(lsm6dso.accel_ready_of(d))
+    test.assert(not lsm6dso.gyro_ready_of(d))
+    c.st.insert(42, 1)
+    test.assert(lsm6dso.gyro_ready_of(d))
+    let _ = lsm6dso.accel_read_of(d)
+    test.assert(not lsm6dso.accel_ready_of(d))
+    test.assert(lsm6dso.gyro_ready_of(d))
+    let _ = lsm6dso.gyro_read_of(d)
+    test.assert(not lsm6dso.gyro_ready_of(d))
+
+@test
+fn test_the_temperature_is_256_counts_a_degree_from_25_degrees() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(lsm6dso.temp_read_of(d) == Some(TempMilliC { milli_c: 25000 }))
+    put16(c, 0x20, 256)
+    test.assert(lsm6dso.temp_read_of(d) == Some(TempMilliC { milli_c: 26000 }))
+    put16(c, 0x20, -256)
+    test.assert(lsm6dso.temp_read_of(d) == Some(TempMilliC { milli_c: 24000 }))
+    put16(c, 0x20, 128)
+    test.assert(lsm6dso.temp_read_of(d) == Some(TempMilliC { milli_c: 25500 }))
+    put16(c, 0x20, 1)
+    test.assert(lsm6dso.temp_read_of(d) == Some(TempMilliC { milli_c: 25003 }))
+
+// ── Range, rate and power mode ───────────────────────────────────────
+
+@test
+fn test_a_range_is_changed_without_touching_the_other_bits() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x10, 0x42)
+    test.assert(lsm6dso.accel_range_write(d, AccelRange8g))
+    test.assert_eq(reg_of(c, 0x10), 0x4E)
+    test.assert(lsm6dso.accel_range_read(d) == AccelRange8g)
+    test.assert(lsm6dso.accel_range_write(d, AccelRange2g))
+    test.assert_eq(reg_of(c, 0x10), 0x42)
+    c.regs.insert(0x11, 0x42)
+    test.assert(lsm6dso.gyro_range_write(d, GyroRange1000dps))
+    test.assert_eq(reg_of(c, 0x11), 0x48)
+    test.assert(lsm6dso.gyro_range_read(d) == GyroRange1000dps)
+
+@test
+fn test_the_125_dps_range_is_set_and_a_normal_range_leaves_it() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x11, 0x48)
+    test.assert(lsm6dso.gyro_range_write_125(d))
+    test.assert_eq(reg_of(c, 0x11), 0x4A)
+    test.assert(lsm6dso.gyro_range_read(d) == GyroRange1000dps)
+    put_gyro(c, 1000, 0, 0)
+    test.assert_eq(gx_of(lsm6dso.gyro_read_of(d)), 4375)
+    test.assert(lsm6dso.gyro_range_write(d, GyroRange250dps))
+    test.assert_eq(reg_of(c, 0x11), 0x40)
+    test.assert_eq(gx_of(lsm6dso.gyro_read_of(d)), 8750)
+
+@test
+fn test_the_range_setters_answer_false_for_a_silent_part() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(not lsm6dso.accel_range_write(d, AccelRange4g))
+    test.assert(not lsm6dso.gyro_range_write(d, GyroRange500dps))
+    test.assert(not lsm6dso.gyro_range_write_125(d))
+    test.assert(lsm6dso.accel_range_read(d) == AccelRange2g)
+    test.assert(lsm6dso.gyro_range_read(d) == GyroRange250dps)
+
+@test
+fn test_the_accelerometer_rate_is_read_with_the_power_mode_it_depends_on() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // Off after a reset.
+    test.assert_eq(lsm6dso.accel_rate_read(d), 0)
+    c.regs.insert(0x10, 0x40)
+    log_clear(c)
+    test.assert_eq(lsm6dso.accel_rate_read(d), 104000)
+    log_is(c, [2, 0x6A, 0x10, 6, -1])
+    // Code 1011: 12.5 Hz in high performance, 1.6 Hz in low-power mode.
+    c.regs.insert(0x10, 0xB0)
+    test.assert_eq(lsm6dso.accel_rate_read(d), 12500)
+    c.regs.insert(0x15, 0x10)
+    test.assert_eq(lsm6dso.accel_rate_read(d), 1600)
+    c.st.insert(4, 0)
+    test.assert_eq(lsm6dso.accel_rate_read(d), -1)
+
+@test
+fn test_a_new_accelerometer_rate_keeps_the_other_bits_of_ctrl1_xl() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x10, 0x0A)
+    test.assert_eq(lsm6dso.accel_rate_write(d, 100000), 104000)
+    test.assert_eq(reg_of(c, 0x10), 0x4A)
+    test.assert_eq(lsm6dso.accel_rate_write(d, 6664000), 6664000)
+    test.assert_eq(reg_of(c, 0x10), 0xAA)
+    // 1.6 Hz only in low-power mode.
+    test.assert_eq(lsm6dso.accel_rate_write(d, 1600), 12500)
+    test.assert_eq(reg_of(c, 0x10), 0x1A)
+    c.regs.insert(0x15, 0x10)
+    test.assert_eq(lsm6dso.accel_rate_write(d, 1600), 1600)
+    test.assert_eq(reg_of(c, 0x10), 0xBA)
+    // A request of 0 powers the sensor down.
+    test.assert_eq(lsm6dso.accel_rate_write(d, 0), 0)
+    test.assert_eq(reg_of(c, 0x10), 0x0A)
+
+@test
+fn test_an_accelerometer_rate_that_is_not_taken_answers_minus_one() [io, hw]
+    let c = chip()
+    c.regs.insert(0x10, 0x00)
+    c.ro.insert(0x10, 1)
+    test.assert_eq(lsm6dso.accel_rate_write(i2c_dut(c), 100000), -1)
+    let e = chip()
+    e.st.insert(4, 0)
+    test.assert_eq(lsm6dso.accel_rate_write(i2c_dut(e), 100000), -1)
+
+@test
+fn test_the_gyroscope_rate_is_read_and_set_without_a_1_6_hz() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(lsm6dso.gyro_rate_read(d), 0)
+    test.assert_eq(lsm6dso.gyro_rate_write(d, 200000), 208000)
+    test.assert_eq(reg_of(c, 0x11), 0x50)
+    test.assert_eq(lsm6dso.gyro_rate_read(d), 208000)
+    c.regs.insert(0x11, 0x0C)
+    test.assert_eq(lsm6dso.gyro_rate_write(d, 1600), 12500)
+    test.assert_eq(reg_of(c, 0x11), 0x1C)
+    test.assert_eq(lsm6dso.gyro_rate_write(d, 0), 0)
+    test.assert_eq(reg_of(c, 0x11), 0x0C)
+    // Code 1011 is no rate of the gyroscope.
+    c.regs.insert(0x11, 0xB0)
+    test.assert_eq(lsm6dso.gyro_rate_read(d), 0)
+    c.ro.insert(0x11, 1)
+    test.assert_eq(lsm6dso.gyro_rate_write(d, 200000), -1)
+    c.st.insert(4, 0)
+    test.assert_eq(lsm6dso.gyro_rate_read(d), -1)
+
+@test
+fn test_the_rates_in_whole_hertz_for_the_traits() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(lsm6dso.accel_rate_hz_read(d), 0)
+    test.assert_eq(lsm6dso.accel_rate_hz_write(d, 100), 104)
+    test.assert_eq(lsm6dso.accel_rate_hz_read(d), 104)
+    test.assert_eq(lsm6dso.accel_rate_hz_write(d, 12), 13)
+    test.assert_eq(lsm6dso.accel_rate_hz_write(d, 0), 0)
+    test.assert_eq(lsm6dso.gyro_rate_hz_write(d, 400), 416)
+    test.assert_eq(lsm6dso.gyro_rate_hz_read(d), 416)
+    c.st.insert(4, 0)
+    test.assert_eq(lsm6dso.accel_rate_hz_read(d), 0)
+    test.assert_eq(lsm6dso.accel_rate_hz_write(d, 100), 0)
+    test.assert_eq(lsm6dso.gyro_rate_hz_read(d), 0)
+    test.assert_eq(lsm6dso.gyro_rate_hz_write(d, 100), 0)
+
+@test
+fn test_the_power_modes_are_the_hm_mode_bits() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(lsm6dso.accel_mode_read(d) == Lsm6dsoMode.Lsm6dsoHighPerf)
+    test.assert(lsm6dso.gyro_mode_read(d) == Lsm6dsoMode.Lsm6dsoHighPerf)
+    c.regs.insert(0x15, 0x07)
+    c.regs.insert(0x16, 0x05)
+    test.assert(lsm6dso.accel_mode_write(d, Lsm6dsoMode.Lsm6dsoLowPower))
+    test.assert_eq(reg_of(c, 0x15), 0x17)
+    test.assert(lsm6dso.accel_mode_read(d) == Lsm6dsoMode.Lsm6dsoLowPower)
+    test.assert(lsm6dso.gyro_mode_write(d, Lsm6dsoMode.Lsm6dsoLowPower))
+    test.assert_eq(reg_of(c, 0x16), 0x85)
+    test.assert(lsm6dso.gyro_mode_read(d) == Lsm6dsoMode.Lsm6dsoLowPower)
+    test.assert(lsm6dso.accel_mode_write(d, Lsm6dsoMode.Lsm6dsoHighPerf))
+    test.assert_eq(reg_of(c, 0x15), 0x07)
+    test.assert(lsm6dso.gyro_mode_write(d, Lsm6dsoMode.Lsm6dsoHighPerf))
+    test.assert_eq(reg_of(c, 0x16), 0x05)
+    c.st.insert(4, 0)
+    test.assert(not lsm6dso.accel_mode_write(d, Lsm6dsoMode.Lsm6dsoLowPower))
+    test.assert(not lsm6dso.gyro_mode_write(d, Lsm6dsoMode.Lsm6dsoLowPower))
+    test.assert(lsm6dso.accel_mode_read(d) == Lsm6dsoMode.Lsm6dsoHighPerf)
+    test.assert(lsm6dso.gyro_mode_read(d) == Lsm6dsoMode.Lsm6dsoHighPerf)
+
+// ── The interrupt pins ───────────────────────────────────────────────
+
+@test
+fn test_the_interrupt_routes_write_the_masks() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(lsm6dso.int1_route(d, lsm6dso.INT1_DRDY_XL | lsm6dso.INT1_FIFO_TH))
+    test.assert_eq(reg_of(c, 0x0D), 0x09)
+    test.assert(lsm6dso.int2_route(d, lsm6dso.INT2_DRDY_G | lsm6dso.INT2_DRDY_TEMP))
+    test.assert_eq(reg_of(c, 0x0E), 0x06)
+    test.assert_eq(lsm6dso.INT1_DRDY_G, 0x02)
+    test.assert_eq(lsm6dso.INT1_FIFO_OVR, 0x10)
+    test.assert_eq(lsm6dso.INT1_FIFO_FULL, 0x20)
+    test.assert_eq(lsm6dso.INT2_DRDY_XL, 0x01)
+    test.assert_eq(lsm6dso.INT2_FIFO_TH, 0x08)
+    c.ro.insert(0x0D, 1)
+    c.ro.insert(0x0E, 1)
+    test.assert(not lsm6dso.int1_route(d, 0x03))
+    test.assert(not lsm6dso.int2_route(d, 0x03))
+
+@test
+fn test_the_pins_polarity_and_output_type_are_two_bits_of_ctrl3_c() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x12, 0x44)
+    test.assert(lsm6dso.int_pins_config(d, true, false))
+    test.assert_eq(reg_of(c, 0x12), 0x64)
+    test.assert(lsm6dso.int_pins_config(d, false, true))
+    test.assert_eq(reg_of(c, 0x12), 0x54)
+    test.assert(lsm6dso.int_pins_config(d, true, true))
+    test.assert_eq(reg_of(c, 0x12), 0x74)
+    test.assert(lsm6dso.int_pins_config(d, false, false))
+    test.assert_eq(reg_of(c, 0x12), 0x44)
+
+// ── The FIFO ─────────────────────────────────────────────────────────
+
+@test
+fn test_fifo_start_goes_through_bypass_and_sets_the_mode_last() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x10, 0x40)
+    c.regs.insert(0x11, 0x50)
+    c.regs.insert(0x0D, 0x03)
+    log_clear(c)
+    test.assert(lsm6dso.fifo_start(d, 100, true))
+    test.assert_eq(reg_of(c, 0x07), 100)
+    test.assert_eq(reg_of(c, 0x08), 0)
+    // Gyroscope batched at 208 Hz (code 5), accelerometer at 104 Hz (4).
+    test.assert_eq(reg_of(c, 0x09), 0x54)
+    test.assert_eq(reg_of(c, 0x0D), 0x08)
+    test.assert_eq(reg_of(c, 0x0A), 0x06)
+    // The ranges are read, then bypass is written first and the mode last.
+    test.assert_eq(at(c.log, 2), 0x10)
+    test.assert_eq(at(c.log, 7), 0x0A)
+    test.assert_eq(at(c.log, 8), 0x00)
+    let n = at(c.st, 99)
+    test.assert_eq(at(c.log, n - 8), 0x0A)
+    test.assert_eq(at(c.log, n - 7), 0x06)
+
+@test
+fn test_fifo_start_batches_the_accelerometer_alone_and_holds_the_threshold() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x10, 0x30)
+    c.regs.insert(0x11, 0x50)
+    test.assert(lsm6dso.fifo_start(d, 0, false))
+    test.assert_eq(reg_of(c, 0x07), 1)
+    test.assert_eq(reg_of(c, 0x09), 0x03)
+    // The watermark's ninth bit rides in FIFO_CTRL2, whose other bits stay.
+    c.regs.insert(0x08, 0x80)
+    test.assert(lsm6dso.fifo_start(d, 400, false))
+    test.assert_eq(reg_of(c, 0x07), 144)
+    test.assert_eq(reg_of(c, 0x08), 0x81)
+    test.assert(lsm6dso.fifo_start(d, 9999, false))
+    test.assert_eq(reg_of(c, 0x07), 255)
+    test.assert_eq(reg_of(c, 0x08), 0x81)
+    test.assert(lsm6dso.fifo_start(d, 5, false))
+    test.assert_eq(reg_of(c, 0x08), 0x80)
+
+@test
+fn test_fifo_stop_returns_to_bypass_and_restores_the_data_ready_flags() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x0A, 0x06)
+    c.regs.insert(0x09, 0x54)
+    c.regs.insert(0x0D, 0x48)
+    test.assert(lsm6dso.fifo_stop(d))
+    test.assert_eq(reg_of(c, 0x0A), 0)
+    test.assert_eq(reg_of(c, 0x09), 0)
+    test.assert_eq(reg_of(c, 0x0D), 0x43)
+
+@test
+fn test_the_fifo_refusals() [io, hw]
+    for r in [0x0A, 0x07, 0x09]
+        let c = chip()
+        c.regs.insert(0x0A, 0x06)
+        c.regs.insert(0x07, 0x11)
+        c.regs.insert(0x09, 0x33)
+        c.ro.insert(r, 1)
+        test.assert(not lsm6dso.fifo_start(i2c_dut(c), 5, true))
+    for r in [0x08, 0x0D]
+        let c = chip()
+        c.regs.insert(0x08, 0x01)
+        c.regs.insert(0x0D, 0x00)
+        c.ro.insert(r, 1)
+        test.assert(not lsm6dso.fifo_start(i2c_dut(c), 5, true))
+    // The last write, the mode.
+    let e = chip()
+    test.assert(not lsm6dso.fifo_start(flaky_write(e, 0x0A, 2), 5, false))
+    let g = chip()
+    g.st.insert(4, 0)
+    test.assert(not lsm6dso.fifo_start(i2c_dut(g), 5, false))
+    for r in [0x0A, 0x09, 0x0D]
+        let c = chip()
+        c.regs.insert(0x0A, 0x06)
+        c.regs.insert(0x09, 0x33)
+        c.regs.insert(0x0D, 0x08)
+        c.ro.insert(r, 1)
+        test.assert(not lsm6dso.fifo_stop(i2c_dut(c)))
+
+@test
+fn test_the_fifo_count_is_ten_bits_over_two_registers() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x0A, 0x06)
+    test.assert_eq(lsm6dso.fifo_count(d), 0)
+    c.st.insert(67, 1)
+    for _i in 0..300
+        fifo_word(c, 2, 1, 2, 3)
+    test.assert_eq(lsm6dso.fifo_count(d), 300)
+    c.st.insert(4, 0)
+    test.assert_eq(lsm6dso.fifo_count(d), 0)
+
+@test
+fn test_the_accelerometer_words_are_read_oldest_first_and_the_gyroscope_words_dropped() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x0A, 0x06)
+    c.regs.insert(0x10, 0x48)
+    fifo_word(c, 1, 5, 5, 5)
+    fifo_word(c, 2, 1000, 0, 0)
+    fifo_word(c, 1, 6, 6, 6)
+    fifo_word(c, 2, 0, 2000, 0)
+    fifo_word(c, 5, 0, 0, 0)
+    fifo_word(c, 2, 0, 0, -1000)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    // Six words come out; three are the accelerometer's, at ±4 g.
+    test.assert_eq(lsm6dso.fifo_read(d, var out), 6)
+    test.assert_eq(out.len(), 3)
+    test.assert_eq(out[0].x, 122)
+    test.assert_eq(out[1].y, 244)
+    test.assert_eq(out[2].z, -122)
+    test.assert_eq(lsm6dso.fifo_count(d), 0)
+
+@test
+fn test_each_fifo_word_is_one_burst_of_the_tag_and_six_data_bytes() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x0A, 0x06)
+    fifo_word(c, 2, 1, 2, 3)
+    fifo_word(c, 2, 4, 5, 6)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    log_clear(c)
+    test.assert_eq(lsm6dso.fifo_read(d, var out), 2)
+    log_is(c, [2, 0x6A, 0x3A, 2, -1, 2, 0x6A, 0x10, 2, -1, 2, 0x6A, 0x78, 7, -1, 2, 0x6A, 0x78, 7, -1])
+
+@test
+fn test_an_accelerometer_list_takes_no_word_it_has_no_room_for() [io, hw]
+    let c = chip()
+    c.st.insert(67, 1)
+    c.regs.insert(0x0A, 0x06)
+    for i in 0..40
+        fifo_word(c, 2, i, 0, 0)
+    let d = i2c_dut(c)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    test.assert_eq(lsm6dso.fifo_read(d, var out), 32)
+    test.assert_eq(out.len(), 32)
+    test.assert_eq(lsm6dso.fifo_count(d), 8)
+    test.assert_eq(lsm6dso.fifo_read(d, var out), 8)
+    test.assert_eq(out.len(), 8)
+
+@test
+fn test_an_empty_fifo_or_a_silent_part_moves_nothing() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    let _ = out.push(AccelMilliG { x: 9, y: 9, z: 9 })
+    test.assert_eq(lsm6dso.fifo_read(d, var out), 0)
+    test.assert_eq(out.len(), 0)
+    var g: Vec[GyroMilliDps; 32] = Vec.new()
+    test.assert_eq(lsm6dso.fifo_read_imu(d, var out, var g), 0)
+    // A part that answers the count and then not the ranges.
+    let e = chip()
+    e.regs.insert(0x0A, 0x06)
+    fifo_word(e, 2, 1, 2, 3)
+    test.assert_eq(lsm6dso.fifo_read(flaky_read(e, 0x10, 1), var out), 0)
+    test.assert_eq(lsm6dso.fifo_read_imu(flaky_read(e, 0x10, 1), var out, var g), 0)
+    // And one that stops after the first word.
+    let h = chip()
+    h.regs.insert(0x0A, 0x06)
+    fifo_word(h, 2, 1, 2, 3)
+    fifo_word(h, 2, 1, 2, 3)
+    fifo_word(h, 2, 1, 2, 3)
+    let f = flaky(h)
+    f.quiet.insert(1, 1)
+    f.quiet.insert(0, 1)
+    test.assert_eq(lsm6dso.fifo_read(f, var out), 1)
+    test.assert_eq(out.len(), 1)
+    let k = chip()
+    k.regs.insert(0x0A, 0x06)
+    fifo_word(k, 2, 1, 2, 3)
+    fifo_word(k, 1, 1, 2, 3)
+    let m = flaky(k)
+    m.quiet.insert(1, 1)
+    m.quiet.insert(0, 1)
+    test.assert_eq(lsm6dso.fifo_read_imu(m, var out, var g), 1)
+
+@test
+fn test_both_sensors_words_are_read_into_two_lists_at_their_own_ranges() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x0A, 0x06)
+    // The accelerometer at ±4 g, the gyroscope at ±500 dps.
+    c.regs.insert(0x10, 0x48)
+    c.regs.insert(0x11, 0x44)
+    fifo_word(c, 1, 1000, 0, 0)
+    fifo_word(c, 2, 1000, 0, 0)
+    fifo_word(c, 3, 7, 7, 7)
+    fifo_word(c, 1, 0, -1000, 0)
+    fifo_word(c, 2, 0, 0, 2000)
+    var a: Vec[AccelMilliG; 32] = Vec.new()
+    var g: Vec[GyroMilliDps; 32] = Vec.new()
+    test.assert_eq(lsm6dso.fifo_read_imu(d, var a, var g), 5)
+    test.assert_eq(a.len(), 2)
+    test.assert_eq(g.len(), 2)
+    test.assert_eq(a[0].x, 122)
+    test.assert_eq(a[1].z, 244)
+    test.assert_eq(g[0].x, 17500)
+    test.assert_eq(g[1].y, -17500)
+
+@test
+fn test_a_list_that_is_full_stops_the_read_before_it_takes_a_word() [io, hw]
+    let c = chip()
+    c.st.insert(67, 1)
+    c.regs.insert(0x0A, 0x06)
+    for i in 0..34
+        fifo_word(c, 1, i, 0, 0)
+        fifo_word(c, 2, i, 0, 0)
+    let d = i2c_dut(c)
+    var a: Vec[AccelMilliG; 32] = Vec.new()
+    var g: Vec[GyroMilliDps; 32] = Vec.new()
+    // The gyroscope's list fills first, with 31 of the accelerometer's.
+    test.assert_eq(lsm6dso.fifo_read_imu(d, var a, var g), 63)
+    test.assert_eq(a.len(), 31)
+    test.assert_eq(g.len(), 32)
+    test.assert_eq(lsm6dso.fifo_count(d), 5)
+
+// ── Self-tests ───────────────────────────────────────────────────────
+
+fn self_test_chip() -> Chip
+    let c = chip()
+    c.st.insert(43, 1)
+    c.st.insert(67, 1)
+    // The accelerometer reads 1 g on Z at the test's ±4 g step of 122 ug.
+    put_accel(c, 0, 0, 8192)
+    c.st.insert(30, 1000)
+    c.st.insert(31, 2000)
+    c.st.insert(32, 3000)
+    c.st.insert(33, 3000)
+    c.st.insert(34, 4000)
+    c.st.insert(35, 5000)
+    c
+
+@test
+fn test_the_accelerometer_self_test_is_the_change_the_force_makes_in_milli_g() [io, hw]
+    let c = self_test_chip()
+    let d = i2c_dut(c)
+    let r = lsm6dso.accel_self_test(d, false)
+    test.assert_eq(x_of(r), 122)
+    test.assert_eq(y_of(r), 244)
+    test.assert_eq(z_of(r), 366)
+    match r
+        Some(delta) => test.assert(lsm6dso.accel_self_test_within(delta))
+        None        => test.assert(false)
+    // The negative force changes the outputs the other way.
+    let n = lsm6dso.accel_self_test(d, true)
+    test.assert_eq(x_of(n), -122)
+    test.assert_eq(y_of(n), -244)
+    test.assert_eq(z_of(n), -366)
+
+@test
+fn test_the_accelerometer_self_test_puts_back_what_it_changed() [io, hw]
+    let c = self_test_chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x10, 0x6C)
+    c.regs.insert(0x12, 0x04)
+    let r = lsm6dso.accel_self_test(d, false)
+    test.assert(r != None)
+    test.assert_eq(reg_of(c, 0x10), 0x6C)
+    test.assert_eq(reg_of(c, 0x14), 0x00)
+    // Block data update was turned on and stays.
+    test.assert_eq(reg_of(c, 0x12), 0x44)
+
+@test
+fn test_the_accelerometer_self_test_runs_at_52_hz_and_4_g() [io, hw]
+    let c = self_test_chip()
+    c.st.insert(67, 0)
+    let d = i2c_dut(c)
+    c.regs.insert(0x14, 0x0C)
+    let _ = lsm6dso.accel_self_test(d, false)
+    // CTRL1_XL was written 0x38 and read back: find the write.
+    var found = false
+    let n = at(c.st, 99)
+    for k in 0..(n - 4)
+        if at(c.log, k) == 1 and at(c.log, k + 2) == 0x10 and at(c.log, k + 3) == 0x38
+            found = true
+    test.assert(found)
+    // The gyroscope's self-test field was left alone.
+    test.assert_eq(reg_of(c, 0x14), 0x0C)
+
+@test
+fn test_the_accelerometer_self_test_gives_nothing_when_no_sample_comes() [io, hw]
+    let c = self_test_chip()
+    c.st.insert(43, 0)
+    c.regs.insert(0x10, 0x20)
+    test.assert(lsm6dso.accel_self_test(i2c_dut(c), false) == None)
+    test.assert_eq(reg_of(c, 0x10), 0x20)
+    // The second run loses its samples: 11 in the first run.
+    let e = self_test_chip()
+    e.st.insert(45, 1)
+    e.st.insert(44, 11)
+    test.assert(lsm6dso.accel_self_test(i2c_dut(e), false) == None)
+    test.assert_eq(reg_of(e, 0x14), 0)
+
+@test
+fn test_the_accelerometer_self_test_that_cannot_be_set_up_gives_nothing() [io, hw]
+    let s = chip()
+    s.st.insert(4, 0)
+    test.assert(lsm6dso.accel_self_test(i2c_dut(s), false) == None)
+    let c = self_test_chip()
+    c.ro.insert(0x12, 1)
+    test.assert(lsm6dso.accel_self_test(i2c_dut(c), false) == None)
+    let e = self_test_chip()
+    e.regs.insert(0x12, 0x44)
+    e.ro.insert(0x10, 1)
+    test.assert(lsm6dso.accel_self_test(i2c_dut(e), false) == None)
+    let g = self_test_chip()
+    let h = flaky_write(g, 0x14, 1)
+    test.assert(lsm6dso.accel_self_test(h, false) == None)
+    // The sample reads fail after the flag came.
+    let k = self_test_chip()
+    test.assert(lsm6dso.accel_self_test(flaky_read(k, 0x28, 1), false) == None)
+
+@test
+fn test_the_gyroscope_self_test_is_the_change_the_force_makes_in_milli_dps() [io, hw]
+    let c = self_test_chip()
+    let d = i2c_dut(c)
+    let r = lsm6dso.gyro_self_test(d, false)
+    test.assert_eq(gx_of(r), 210000)
+    test.assert_eq(gy_of(r), 280000)
+    test.assert_eq(gz_of(r), 350000)
+    match r
+        Some(delta) => test.assert(lsm6dso.gyro_self_test_within(delta))
+        None        => test.assert(false)
+    let n = lsm6dso.gyro_self_test(d, true)
+    test.assert_eq(gx_of(n), -210000)
+    test.assert_eq(gz_of(n), -350000)
+    test.assert_eq(reg_of(c, 0x14), 0)
+    test.assert_eq(reg_of(c, 0x11), 0)
+
+@test
+fn test_the_gyroscope_self_test_puts_back_its_range_and_rate() [io, hw]
+    let c = self_test_chip()
+    c.regs.insert(0x11, 0x28)
+    test.assert(lsm6dso.gyro_self_test(i2c_dut(c), false) != None)
+    test.assert_eq(reg_of(c, 0x11), 0x28)
+
+@test
+fn test_the_gyroscope_self_test_refusals() [io, hw]
+    let s = chip()
+    s.st.insert(4, 0)
+    test.assert(lsm6dso.gyro_self_test(i2c_dut(s), false) == None)
+    let c = self_test_chip()
+    c.st.insert(43, 0)
+    test.assert(lsm6dso.gyro_self_test(i2c_dut(c), false) == None)
+    let e = self_test_chip()
+    e.st.insert(45, 1)
+    e.st.insert(44, 26)
+    test.assert(lsm6dso.gyro_self_test(i2c_dut(e), false) == None)
+    let g = self_test_chip()
+    g.ro.insert(0x12, 1)
+    test.assert(lsm6dso.gyro_self_test(i2c_dut(g), false) == None)
+    let h = self_test_chip()
+    h.regs.insert(0x12, 0x44)
+    h.ro.insert(0x11, 1)
+    test.assert(lsm6dso.gyro_self_test(i2c_dut(h), false) == None)
+    let k = self_test_chip()
+    test.assert(lsm6dso.gyro_self_test(flaky_write(k, 0x14, 1), false) == None)
+    let m = self_test_chip()
+    test.assert(lsm6dso.gyro_self_test(flaky_read(m, 0x22, 1), false) == None)
+
+@test
+fn test_the_self_test_windows_are_table_2s() [io, hw]
+    test.assert(lsm6dso.accel_self_test_within(AccelMilliG { x: 122, y: -244, z: 1700 }))
+    test.assert(lsm6dso.accel_self_test_within(AccelMilliG { x: 50, y: 50, z: -50 }))
+    test.assert(not lsm6dso.accel_self_test_within(AccelMilliG { x: 49, y: 100, z: 100 }))
+    test.assert(not lsm6dso.accel_self_test_within(AccelMilliG { x: 100, y: -49, z: 100 }))
+    test.assert(not lsm6dso.accel_self_test_within(AccelMilliG { x: 100, y: 100, z: 0 }))
+    test.assert(not lsm6dso.accel_self_test_within(AccelMilliG { x: 1701, y: 100, z: 100 }))
+    test.assert(not lsm6dso.accel_self_test_within(AccelMilliG { x: 100, y: -1701, z: 100 }))
+    test.assert(not lsm6dso.accel_self_test_within(AccelMilliG { x: 100, y: 100, z: 1701 }))
+    test.assert(lsm6dso.gyro_self_test_within(GyroMilliDps { x: 150000, y: -700000, z: 300000 }))
+    test.assert(not lsm6dso.gyro_self_test_within(GyroMilliDps { x: 149999, y: 200000, z: 200000 }))
+    test.assert(not lsm6dso.gyro_self_test_within(GyroMilliDps { x: 200000, y: 149999, z: 200000 }))
+    test.assert(not lsm6dso.gyro_self_test_within(GyroMilliDps { x: 200000, y: 200000, z: 149999 }))
+    test.assert(not lsm6dso.gyro_self_test_within(GyroMilliDps { x: 700001, y: 200000, z: 200000 }))
+    test.assert(not lsm6dso.gyro_self_test_within(GyroMilliDps { x: 200000, y: 700001, z: 200000 }))
+    test.assert(not lsm6dso.gyro_self_test_within(GyroMilliDps { x: 200000, y: 200000, z: 700001 }))
+
+// ── Bring-up ─────────────────────────────────────────────────────────
+
+fn stale_chip() -> Chip
+    let c = chip()
+    // What a previous run of the program, or another bank, could leave.
+    c.regs.insert(0x01, 0x80)
+    c.regs.insert(0x0A, 0x06)
+    c.regs.insert(0x0D, 0x7F)
+    c.regs.insert(0x10, 0xBC)
+    c.regs.insert(0x11, 0xFE)
+    c.regs.insert(0x12, 0x00)
+    c.regs.insert(0x15, 0x10)
+    c.regs.insert(0x16, 0x80)
+    c.regs.insert(0x17, 0x02)
+    c.regs.insert(0x18, 0x00)
+    c
+
+@test
+fn test_begin_brings_the_part_up_over_i2c() [io, hw]
+    let c = stale_chip()
+    test.assert(lsm6dso.start(i2c_dut(c)))
+    // The user bank, block data update and the address increment.
+    test.assert_eq(reg_of(c, 0x01), 0x00)
+    test.assert_eq(reg_of(c, 0x12), 0x44)
+    // I3C off, with the DEN bits the part resets to kept.
+    test.assert_eq(reg_of(c, 0x18), 0xE2)
+    // Data-ready masked while the filters settle; the I2C block stays on.
+    test.assert_eq(reg_of(c, 0x13), 0x08)
+    test.assert_eq(reg_of(c, 0x17), 0x00)
+    test.assert_eq(reg_of(c, 0x15), 0x00)
+    test.assert_eq(reg_of(c, 0x16), 0x00)
+    test.assert_eq(reg_of(c, 0x0D), 0x03)
+    test.assert_eq(reg_of(c, 0x0A), 0x00)
+    // 104 Hz both, ±2 g and ±250 dps.
+    test.assert_eq(reg_of(c, 0x10), 0x40)
+    test.assert_eq(reg_of(c, 0x11), 0x40)
+
+@test
+fn test_begin_turns_the_i2c_block_off_on_spi() [io, hw]
+    let c = stale_chip()
+    test.assert(lsm6dso.start(spi_dut(c)))
+    test.assert_eq(reg_of(c, 0x13), 0x0C)
+    test.assert_eq(reg_of(c, 0x12), 0x44)
+    test.assert_eq(at(c.st, 21), 3)
+
+@test
+fn test_begin_resets_the_part_and_waits_for_the_reset_by_polling() [io, hw]
+    let c = chip()
+    c.st.insert(66, 30)
+    let d = i2c_dut(c)
+    log_clear(c)
+    test.assert(lsm6dso.start(d))
+    // FUNC_CFG_ACCESS write and read back, WHO_AM_I, the reset write, then
+    // the polls of CTRL3_C: 30 read set and the 31st clear.
+    test.assert_eq(at(c.log, 0), 1)
+    test.assert_eq(at(c.log, 2), 0x01)
+    test.assert_eq(at(c.log, 10), 2)
+    test.assert_eq(at(c.log, 12), 0x0F)
+    test.assert_eq(at(c.log, 15), 1)
+    test.assert_eq(at(c.log, 17), 0x12)
+    test.assert_eq(at(c.log, 18), 0x01)
+    test.assert_eq(at(c.log, 20), 2)
+    test.assert_eq(at(c.log, 22), 0x12)
+    // After 31 polls the next write is CTRL3_C again.
+    test.assert_eq(at(c.log, 20 + 5 * 31), 1)
+    test.assert_eq(at(c.log, 20 + 5 * 31 + 2), 0x12)
+    test.assert_eq(at(c.log, 20 + 5 * 31 + 3), 0x44)
+
+@test
+fn test_begin_refuses_a_part_that_is_not_there_or_not_an_lsm6dso() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    test.assert(not lsm6dso.start(i2c_dut(c)))
+    let d = chip()
+    d.regs.insert(0x0F, 0x6B)
+    test.assert(not lsm6dso.start(i2c_dut(d)))
+    let e = chip()
+    test.assert(not lsm6dso.start(I2cDut { bus: FakeI2c { c: e }, pins: pins(e), w: dev_bus.wiring_spi(0, 67) }))
+    let f = chip()
+    test.assert(not lsm6dso.start(flaky_read(f, 0x0F, 1)))
+
+@test
+fn test_begin_refuses_a_part_that_never_finishes_its_reset() [io, hw]
+    let c = chip()
+    c.st.insert(67, 1)
+    c.st.insert(66, 100000)
+    test.assert(not lsm6dso.start(i2c_dut(c)))
+
+@test
+fn test_begin_refuses_a_write_the_part_does_not_take() [io, hw]
+    // The writes of `start` in order, as (register, which write of it).
+    let regs = [0x01, 0x12, 0x12, 0x18, 0x13, 0x17, 0x15, 0x16, 0x0D, 0x11, 0x10]
+    let nth = [1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1]
+    for i in 0..regs.len()
+        let f = flaky_write(stale_chip(), regs[i], nth[i])
+        test.assert(not lsm6dso.start(f))
+        test.assert(at(f.seen, regs[i]) >= nth[i])
+
+// ── The types over the host's board handles ──────────────────────────
+//
+// The host's handles are absent hardware: every transfer is refused, so
+// each method answers its "no part" value.  This runs the lines of the
+// two types that forward to the functions above.
+
+@test
+fn test_the_i2c_type_over_absent_hardware() [io, hw]
+    let w = dev_bus.wiring_i2c(0, 0x6A)
+    let p = Lsm6dso.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not p.begin())
+    test.assert(p.reg(0x0F) == None)
+    test.assert(not p.set_reg(0x10, 1))
+    test.assert_eq(p.gyro_set_rate_hz(104), 0)
+    test.assert_eq(p.accel_rate_mhz(), -1)
+    test.assert_eq(p.set_accel_rate_mhz(104000), -1)
+    test.assert_eq(p.gyro_rate_mhz(), -1)
+    test.assert_eq(p.set_gyro_rate_mhz(104000), -1)
+    test.assert(not p.gyro_set_125dps())
+    test.assert(p.accel_mode() == Lsm6dsoMode.Lsm6dsoHighPerf)
+    test.assert(not p.set_accel_mode(Lsm6dsoMode.Lsm6dsoLowPower))
+    test.assert(p.gyro_mode() == Lsm6dsoMode.Lsm6dsoHighPerf)
+    test.assert(not p.set_gyro_mode(Lsm6dsoMode.Lsm6dsoLowPower))
+    test.assert(not p.route_int1(3))
+    test.assert(not p.route_int2(3))
+    test.assert(not p.configure_pins(true, false))
+    test.assert(not p.fifo_begin(10, true))
+    test.assert(not p.fifo_end())
+    var a: Vec[AccelMilliG; 32] = Vec.new()
+    var g: Vec[GyroMilliDps; 32] = Vec.new()
+    test.assert_eq(p.fifo_take_imu(var a, var g), 0)
+    test.assert(p.accel_test(false) == None)
+    test.assert(p.gyro_test(false) == None)
+    test.assert_eq(p.irq_level(), -1)
+    test.assert(not p.on_spi())
+    test.assert(p.accel_read() == None)
+    test.assert(not p.accel_ready())
+    test.assert(p.accel_range() == AccelRange2g)
+    test.assert(not p.accel_set_range(AccelRange4g))
+    test.assert_eq(p.accel_rate_hz(), 0)
+    test.assert_eq(p.accel_set_rate_hz(100), 0)
+    test.assert_eq(p.accel_fifo_count(), 0)
+    test.assert_eq(p.accel_fifo_read(var a), 0)
+    test.assert(p.gyro_read() == None)
+    test.assert(not p.gyro_ready())
+    test.assert(p.gyro_range() == GyroRange250dps)
+    test.assert(not p.gyro_set_range(GyroRange500dps))
+    test.assert_eq(p.gyro_rate_hz(), 0)
+    test.assert(p.imu_read() == None)
+    test.assert_eq(p.temp_start(), 0)
+    test.assert(p.temp_read() == None)
+    test.assert(p.device_id() == None)
+
+@test
+fn test_the_spi_type_over_absent_hardware() [io, hw]
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    let p = Lsm6dsoSpi.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not p.begin())
+    test.assert(p.reg(0x0F) == None)
+    test.assert(not p.set_reg(0x10, 1))
+    test.assert_eq(p.gyro_set_rate_hz(104), 0)
+    test.assert_eq(p.accel_rate_mhz(), -1)
+    test.assert_eq(p.set_accel_rate_mhz(104000), -1)
+    test.assert_eq(p.gyro_rate_mhz(), -1)
+    test.assert_eq(p.set_gyro_rate_mhz(104000), -1)
+    test.assert(not p.gyro_set_125dps())
+    test.assert(p.accel_mode() == Lsm6dsoMode.Lsm6dsoHighPerf)
+    test.assert(not p.set_accel_mode(Lsm6dsoMode.Lsm6dsoLowPower))
+    test.assert(p.gyro_mode() == Lsm6dsoMode.Lsm6dsoHighPerf)
+    test.assert(not p.set_gyro_mode(Lsm6dsoMode.Lsm6dsoLowPower))
+    test.assert(not p.route_int1(3))
+    test.assert(not p.route_int2(3))
+    test.assert(not p.configure_pins(true, false))
+    test.assert(not p.fifo_begin(10, true))
+    test.assert(not p.fifo_end())
+    var a: Vec[AccelMilliG; 32] = Vec.new()
+    var g: Vec[GyroMilliDps; 32] = Vec.new()
+    test.assert_eq(p.fifo_take_imu(var a, var g), 0)
+    test.assert(p.accel_test(true) == None)
+    test.assert(p.gyro_test(true) == None)
+    test.assert_eq(p.irq_level(), -1)
+    test.assert(p.on_spi())
+    test.assert(p.accel_read() == None)
+    test.assert(not p.accel_ready())
+    test.assert(p.accel_range() == AccelRange2g)
+    test.assert(not p.accel_set_range(AccelRange4g))
+    test.assert_eq(p.accel_rate_hz(), 0)
+    test.assert_eq(p.accel_set_rate_hz(100), 0)
+    test.assert_eq(p.accel_fifo_count(), 0)
+    test.assert_eq(p.accel_fifo_read(var a), 0)
+    test.assert(p.gyro_read() == None)
+    test.assert(not p.gyro_ready())
+    test.assert(p.gyro_range() == GyroRange250dps)
+    test.assert(not p.gyro_set_range(GyroRange500dps))
+    test.assert_eq(p.gyro_rate_hz(), 0)
+    test.assert(p.imu_read() == None)
+    test.assert_eq(p.temp_start(), 0)
+    test.assert(p.temp_read() == None)
+    test.assert(p.device_id() == None)

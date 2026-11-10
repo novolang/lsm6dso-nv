@@ -1,0 +1,56 @@
+// device_read — a reading loop for an LSM6DSO on a breakout, for an nRF52840
+// DK or an nRF54LM20 DK.
+//
+// The breakout's SDA and SCL go to the board's I2C pins, its CS pin to
+// the supply, which selects I2C, and its SDO/SA0 pin to ground, which puts
+// the part at 0x6A; INT1 goes to a free GPIO, if the program is to read the
+// data-ready line, and is left low or open while the part powers up.  The
+// program waits the 35 ms the part takes to turn on, brings it up at 104 Hz,
+// ±2 g and ±250 dps, and prints one line per pair of samples over RTT:
+//
+//     lsm6dso ax=<milli-g> ay=<milli-g> az=<milli-g> gx=<mdps> gy=<mdps> gz=<mdps>
+//
+// With the board flat and face up, az is close to 1000 and the gyroscope
+// reads near 0.
+//
+// Build it with `novo build --target=nrf52840-dk tests/device_read.nv` or
+// `novo build --target=nrf54lm20-dk tests/device_read.nv`.
+
+use embedded_hal.{ BoardI2c, BoardGpio }
+use dev_bus
+use dev_accel.{ AccelMilliG, Accelerometer }
+use dev_imu.{ ImuSample, Imu }
+use lsm6dso
+use lsm6dso.{ Lsm6dso }
+
+// The part's address with the SDO/SA0 pin low.
+const ADDR = 0x6A
+
+// A label and a number, written without building a string.
+fn field(label: Str, v: Int) [hw]
+    hal.uart.write(label)
+    hal.uart.write(str.from_int(v))
+
+@tier(embedded)
+fn main() [hw]
+    let part = Lsm6dso.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
+    hal.timer.delay_ms(35)
+    if not part.begin()
+        hal.uart.write("lsm6dso: no answer\n")
+        return
+    loop
+        if part.accel_ready()
+            match part.imu_read()
+                Some(s) =>
+                    hal.uart.write("lsm6dso")
+                    field(" ax=", s.accel.x)
+                    field(" ay=", s.accel.y)
+                    field(" az=", s.accel.z)
+                    field(" gx=", s.gyro.x)
+                    field(" gy=", s.gyro.y)
+                    field(" gz=", s.gyro.z)
+                    hal.uart.write("\n")
+                None =>
+                    hal.uart.write("lsm6dso: no result\n")
+        else
+            hal.timer.delay_ms(2)
