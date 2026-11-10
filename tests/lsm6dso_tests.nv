@@ -62,7 +62,11 @@ fn defaults(c: Chip)
 // The chip with its reset values in place.
 @tier(app)
 fn chip() -> Chip
-    let c = Chip { regs: HashMap.new(), st: HashMap.new(), ro: HashMap.new(), log: HashMap.new(), fifo: HashMap.new() }
+    let c = Chip { regs: HashMap.new(),
+        st: HashMap.new(),
+        ro: HashMap.new(),
+        log: HashMap.new(),
+        fifo: HashMap.new() }
     defaults(c)
     c.st.insert(4, 1)
     c.st.insert(66, 2)
@@ -129,7 +133,7 @@ fn out_read(c: Chip, reg: Int) -> Int
         c.st.insert(41, 0)
     else
         c.st.insert(42, 0)
-    var lo = 0x22 + ((reg - 0x22) / 2) * 2
+    var lo = 0x22 + (reg - 0x22) / 2 * 2
     let v = (at(c.regs, lo) | (at(c.regs, lo + 1) << 8)) + st_push(c, reg)
     if (reg - 0x22) % 2 == 0
         return v & 0xFF
@@ -425,7 +429,12 @@ impl Lsm6dsoPort for Flaky
 
 @tier(app)
 fn flaky(c: Chip) -> Flaky
-    Flaky { inner: i2c_dut(c), fail: HashMap.new(), seen: HashMap.new(), rfail: HashMap.new(), rseen: HashMap.new(), quiet: HashMap.new() }
+    Flaky { inner: i2c_dut(c),
+        fail: HashMap.new(),
+        seen: HashMap.new(),
+        rfail: HashMap.new(),
+        rseen: HashMap.new(),
+        quiet: HashMap.new() }
 
 @tier(app)
 fn flaky_write(c: Chip, reg: Int, nth: Int) -> Flaky
@@ -690,7 +699,7 @@ fn test_the_identity_is_who_am_i_on_both_buses() [io, hw]
         Some(id) =>
             test.assert_eq(id.who, 0x6C)
             test.assert(id.rev == None)
-        None => test.assert(false)
+        None     => test.assert(false)
     match lsm6dso.id_read(spi_dut(c))
         Some(id) => test.assert_eq(id.who, 0x6C)
         None     => test.assert(false)
@@ -866,7 +875,7 @@ fn test_a_paired_sample_has_both_from_one_burst_at_their_own_ranges() [io, hw]
             test.assert_eq(s.accel.z, 122)
             test.assert_eq(s.gyro.x, 17500)
             test.assert_eq(s.gyro.y, -17500)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_a_sample_over_spi_is_the_same_burst() [io, hw]
@@ -1394,7 +1403,7 @@ fn test_the_accelerometer_self_test_runs_at_52_hz_and_4_g() [io, hw]
     // CTRL1_XL was written 0x38 and read back: find the write.
     var found = false
     let n = at(c.st, 99)
-    for k in 0..(n - 4)
+    for k in 0..n - 4
         if at(c.log, k) == 1 and at(c.log, k + 2) == 0x10 and at(c.log, k + 3) == 0x38
             found = true
     test.assert(found)

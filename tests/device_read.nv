@@ -50,7 +50,7 @@ fn main() [hw]
                     field(" gy=", s.gyro.y)
                     field(" gz=", s.gyro.z)
                     hal.uart.write("\n")
-                None =>
+                None    =>
                     hal.uart.write("lsm6dso: no result\n")
         else
             hal.timer.delay_ms(2)

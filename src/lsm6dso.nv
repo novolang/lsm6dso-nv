@@ -97,28 +97,28 @@ use dev_thermo.{ TempMilliC, Thermometer }
 use dev_id.{ DeviceId, Identifiable }
 
 // The registers.
-let FUNC_CFG_ACCESS = 0x01
-let FIFO_CTRL1 = 0x07
-let FIFO_CTRL2 = 0x08
-let FIFO_CTRL3 = 0x09
-let FIFO_CTRL4 = 0x0A
-let INT1_CTRL = 0x0D
-let INT2_CTRL = 0x0E
-let WHO_AM_I = 0x0F
-let CTRL1_XL = 0x10
-let CTRL2_G = 0x11
-let CTRL3_C = 0x12
-let CTRL4_C = 0x13
-let CTRL5_C = 0x14
-let CTRL6_C = 0x15
-let CTRL7_G = 0x16
-let CTRL8_XL = 0x17
-let CTRL9_XL = 0x18
-let STATUS_REG = 0x1E
-let OUT_TEMP_L = 0x20
-let OUTX_L_G = 0x22
-let OUTX_L_A = 0x28
-let FIFO_STATUS1 = 0x3A
+let FUNC_CFG_ACCESS   = 0x01
+let FIFO_CTRL1        = 0x07
+let FIFO_CTRL2        = 0x08
+let FIFO_CTRL3        = 0x09
+let FIFO_CTRL4        = 0x0A
+let INT1_CTRL         = 0x0D
+let INT2_CTRL         = 0x0E
+let WHO_AM_I          = 0x0F
+let CTRL1_XL          = 0x10
+let CTRL2_G           = 0x11
+let CTRL3_C           = 0x12
+let CTRL4_C           = 0x13
+let CTRL5_C           = 0x14
+let CTRL6_C           = 0x15
+let CTRL7_G           = 0x16
+let CTRL8_XL          = 0x17
+let CTRL9_XL          = 0x18
+let STATUS_REG        = 0x1E
+let OUT_TEMP_L        = 0x20
+let OUTX_L_G          = 0x22
+let OUTX_L_A          = 0x28
+let FIFO_STATUS1      = 0x3A
 let FIFO_DATA_OUT_TAG = 0x78
 
 // WHO_AM_I's value.
@@ -129,73 +129,73 @@ let SPI_READ = 0x80
 
 // CTRL3_C: block data update, the interrupt pins' polarity and output
 // type, the register address increment, and the software reset.
-let C3_BDU = 0x40
+let C3_BDU       = 0x40
 let C3_H_LACTIVE = 0x20
-let C3_PP_OD = 0x10
-let C3_IF_INC = 0x04
-let C3_SW_RESET = 0x01
+let C3_PP_OD     = 0x10
+let C3_IF_INC    = 0x04
+let C3_SW_RESET  = 0x01
 // CTRL4_C: data-ready masked until the filters settle, and the I2C block
 // off.
-let C4_DRDY_MASK = 0x08
+let C4_DRDY_MASK   = 0x08
 let C4_I2C_DISABLE = 0x04
 // CTRL5_C: the self-test fields.
 let C5_ST_XL_MASK = 0x03
-let C5_ST_G_MASK = 0x0C
-let C5_ST_XL_POS = 0x01
-let C5_ST_XL_NEG = 0x02
-let C5_ST_G_POS = 0x04
-let C5_ST_G_NEG = 0x0C
+let C5_ST_G_MASK  = 0x0C
+let C5_ST_XL_POS  = 0x01
+let C5_ST_XL_NEG  = 0x02
+let C5_ST_G_POS   = 0x04
+let C5_ST_G_NEG   = 0x0C
 // CTRL6_C and CTRL7_G: the bits that leave high-performance mode.
 let C6_XL_HM_MODE = 0x10
-let C7_G_HM_MODE = 0x80
+let C7_G_HM_MODE  = 0x80
 // CTRL8_XL: the full-scale mode, kept clear.
 let C8_XL_FS_MODE = 0x02
 // CTRL9_XL: the I3C block off.
 let C9_I3C_DISABLE = 0x02
 // CTRL1_XL and CTRL2_G: the full-scale field, the gyroscope's 125 dps bit.
 let FS_MASK = 0x0C
-let FS_125 = 0x02
+let FS_125  = 0x02
 // STATUS_REG: the new-data flags.
 let ST_XLDA = 0x01
-let ST_GDA = 0x02
+let ST_GDA  = 0x02
 // FIFO_CTRL4: bypass and continuous mode.
-let FIFO_BYPASS = 0x00
+let FIFO_BYPASS     = 0x00
 let FIFO_CONTINUOUS = 0x06
 // FIFO tags: the gyroscope and the accelerometer, uncompressed.
-let TAG_GYRO = 1
+let TAG_GYRO  = 1
 let TAG_ACCEL = 2
 // The words the FIFO holds, and the most the watermark takes.
 let FIFO_DEPTH_WORDS = 512
-let FIFO_WTM_MAX = 511
+let FIFO_WTM_MAX     = 511
 // The most samples the driver moves out of the FIFO into one list.
 let LIST_DEPTH = 32
 
 // The temperature sensor: 256 counts per degree, 0 at 25 °C (Table 4).
 let TEMP_COUNTS_PER_C = 256
-let TEMP_ZERO_MC = 25000
+let TEMP_ZERO_MC      = 25000
 
 // The ODR codes `start` sets, 104 Hz for both sensors.
 let ODR_104 = 4
 
 // The clocks `setup` asks for: I2C fast mode, and SPI at 4 MHz in mode 3.
-let I2C_HZ = 400000
-let SPI_HZ = 4000000
+let I2C_HZ   = 400000
+let SPI_HZ   = 4000000
 let SPI_MODE = 3
 
 // The most polls of the software-reset bit `start` makes, and of a
 // data-ready flag a self-test makes for one sample.
-let RESET_POLLS = 2000
+let RESET_POLLS     = 2000
 let SELF_TEST_POLLS = 4000
 
 // The self-test procedure of ST's `lsm6dso_self_test` example: the
 // accelerometer at 52 Hz and ±4 g, the gyroscope at 208 Hz and ±2000 dps;
 // the samples that pass while the output settles (100 ms), and the samples
 // averaged.
-let XL_ST_CTRL1 = 0x38
-let G_ST_CTRL2 = 0x5C
+let XL_ST_CTRL1  = 0x38
+let G_ST_CTRL2   = 0x5C
 let XL_ST_SETTLE = 6
-let G_ST_SETTLE = 21
-let ST_AVERAGE = 5
+let G_ST_SETTLE  = 21
+let ST_AVERAGE   = 5
 
 // INT1_CTRL and INT2_CTRL's bits for `int_route`.
 
@@ -265,8 +265,8 @@ pub fn i2c_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [
 // control byte with R/W set, then the data, which the part shifts out with
 // no dummy byte in between.  Whether it ran, which is whether the wiring
 // has a chip select.
-pub fn spi_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int,
-                                            n: Int, var dst: DevBytes) -> Bool [hw]
+pub fn spi_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int, n: Int,
+                                            var dst: DevBytes) -> Bool [hw]
     var tx: DevBytes = Vec.new()
     let _ = tx.push((SPI_READ | (reg & 0x7F)) as u8)
     dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n, var dst)
@@ -409,12 +409,16 @@ fn s16_at(b: DevBytes, i: Int) -> Int
 
 // The milli-g of the three axes at `i` of `b`, for the step `ug`.
 fn accel_at(b: DevBytes, i: Int, ug: Int) -> AccelMilliG
-    AccelMilliG { x: s16_at(b, i) * ug / 1000, y: s16_at(b, i + 2) * ug / 1000, z: s16_at(b, i + 4) * ug / 1000 }
+    AccelMilliG { x: s16_at(b, i) * ug / 1000,
+        y: s16_at(b, i + 2) * ug / 1000,
+        z: s16_at(b, i + 4) * ug / 1000 }
 
 // The milli-degrees per second of the three axes at `i` of `b`, for the
 // step `udps`.
 fn gyro_at(b: DevBytes, i: Int, udps: Int) -> GyroMilliDps
-    GyroMilliDps { x: s16_at(b, i) * udps / 1000, y: s16_at(b, i + 2) * udps / 1000, z: s16_at(b, i + 4) * udps / 1000 }
+    GyroMilliDps { x: s16_at(b, i) * udps / 1000,
+        y: s16_at(b, i + 2) * udps / 1000,
+        z: s16_at(b, i + 4) * udps / 1000 }
 
 // ── Rates ────────────────────────────────────────────────────────────
 
@@ -499,7 +503,8 @@ pub fn imu_read_of<P: Lsm6dsoPort>(p: P) -> ?ImuSample [hw]
     var b: DevBytes = Vec.new()
     if not p.read_regs(OUTX_L_G, 12, var b)
         return None
-    Some(ImuSample { accel: accel_at(b, 6, ug_per_count(r[0] as Int)), gyro: gyro_at(b, 0, udps_per_count(r[1] as Int)) })
+    Some(ImuSample { accel: accel_at(b, 6, ug_per_count(r[0] as Int)),
+        gyro: gyro_at(b, 0, udps_per_count(r[1] as Int)) })
 
 // Whether a new accelerometer sample has completed since the last read:
 // STATUS_REG's XLDA.
@@ -552,7 +557,7 @@ pub fn accel_rate_read<P: Lsm6dsoPort>(p: P) -> Int [hw]
     var b: DevBytes = Vec.new()
     if not p.read_regs(CTRL1_XL, 6, var b)
         return -1
-    xl_mhz_of_code((b[0] as Int) >> 4, ((b[5] as Int) & C6_XL_HM_MODE) != 0)
+    xl_mhz_of_code(b[0] as Int >> 4, (b[5] as Int & C6_XL_HM_MODE) != 0)
 
 // Sets the accelerometer to the slowest rate at or above `mhz` and answers
 // the rate taken, 0 for a request of 0, which powers the sensor down, and
@@ -562,7 +567,7 @@ pub fn accel_rate_write<P: Lsm6dsoPort>(p: P, mhz: Int) -> Int [hw]
     var b: DevBytes = Vec.new()
     if not p.read_regs(CTRL1_XL, 6, var b)
         return -1
-    let lp = ((b[5] as Int) & C6_XL_HM_MODE) != 0
+    let lp = (b[5] as Int & C6_XL_HM_MODE) != 0
     let code = odr_code_for(mhz, lp)
     if not reg_update(p, CTRL1_XL, 0xF0, code << 4)
         return -1
@@ -668,7 +673,7 @@ pub fn fifo_count<P: Lsm6dsoPort>(p: P) -> Int [hw]
     var b: DevBytes = Vec.new()
     if not p.read_regs(FIFO_STATUS1, 2, var b)
         return 0
-    (b[0] as Int) | (((b[1] as Int) & 3) << 8)
+    b[0] as Int | ((b[1] as Int & 3) << 8)
 
 // Turns the FIFO on in continuous mode with the watermark at `threshold`
 // words, 1 to 511, and puts the watermark on INT1 in place of the
@@ -690,14 +695,14 @@ pub fn fifo_start<P: Lsm6dsoPort>(p: P, threshold: Int, with_gyro: Bool) -> Bool
         return false
     var gy = 0
     if with_gyro
-        gy = (r[1] as Int) >> 4
+        gy = r[1] as Int >> 4
     if not reg_write(p, FIFO_CTRL4, FIFO_BYPASS)
         return false
     if not reg_write(p, FIFO_CTRL1, th & 0xFF)
         return false
     if not reg_update(p, FIFO_CTRL2, 0x01, th >> 8)
         return false
-    if not reg_write(p, FIFO_CTRL3, (gy << 4) | ((r[0] as Int) >> 4))
+    if not reg_write(p, FIFO_CTRL3, (gy << 4) | (r[0] as Int >> 4))
         return false
     if not reg_update(p, INT1_CTRL, INT1_DRDY_XL | INT1_DRDY_G | INT1_FIFO_TH, INT1_FIFO_TH)
         return false
@@ -719,7 +724,7 @@ pub fn fifo_stop<P: Lsm6dsoPort>(p: P) -> Bool [hw]
 fn fifo_word<P: Lsm6dsoPort>(p: P, var b: DevBytes) -> Int [hw]
     if not p.read_regs(FIFO_DATA_OUT_TAG, 7, var b)
         return -1
-    (b[0] as Int) >> 3
+    b[0] as Int >> 3
 
 // Moves the accelerometer's words of the FIFO, oldest first, into `dst`,
 // which is emptied first, and answers how many words it took out.  A word
@@ -795,7 +800,7 @@ fn accel_mean<P: Lsm6dsoPort>(p: P, skip: Int) -> ?AccelMilliG [hw]
     var sx = 0
     var sy = 0
     var sz = 0
-    for i in 0..(skip + ST_AVERAGE)
+    for i in 0..skip + ST_AVERAGE
         if not wait_status(p, ST_XLDA)
             return None
         let Some(s) = accel_read_of(p) else return None
@@ -810,7 +815,7 @@ fn gyro_mean<P: Lsm6dsoPort>(p: P, skip: Int) -> ?GyroMilliDps [hw]
     var sx = 0
     var sy = 0
     var sz = 0
-    for i in 0..(skip + ST_AVERAGE)
+    for i in 0..skip + ST_AVERAGE
         if not wait_status(p, ST_GDA)
             return None
         let Some(s) = gyro_read_of(p) else return None
@@ -1051,7 +1056,8 @@ impl Lsm6dso
     fn fifo_end(self) -> Bool [hw]
         fifo_stop(self)
 
-    fn fifo_take_imu(self, var accel: Vec[AccelMilliG; 32], var gyro: Vec[GyroMilliDps; 32]) -> Int [hw]
+    fn fifo_take_imu(self, var accel: Vec[AccelMilliG; 32],
+                     var gyro: Vec[GyroMilliDps; 32]) -> Int [hw]
         fifo_read_imu(self, var accel, var gyro)
 
     // The self-tests (`accel_self_test`, `gyro_self_test`).
@@ -1219,7 +1225,8 @@ impl Lsm6dsoSpi
     fn fifo_end(self) -> Bool [hw]
         fifo_stop(self)
 
-    fn fifo_take_imu(self, var accel: Vec[AccelMilliG; 32], var gyro: Vec[GyroMilliDps; 32]) -> Int [hw]
+    fn fifo_take_imu(self, var accel: Vec[AccelMilliG; 32],
+                     var gyro: Vec[GyroMilliDps; 32]) -> Int [hw]
         fifo_read_imu(self, var accel, var gyro)
 
     // The self-tests (`accel_self_test`, `gyro_self_test`).

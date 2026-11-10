@@ -121,7 +121,7 @@ impl I2cBus for FakeI2c
         var r = data[0] as Int
         for i in 1..data.len()
             if at(self.c.st, 30) == r + 1
-                if at(self.c.st, 34) == 0 or at(self.c.st, 34) == (data[i] as Int) + 1
+                if at(self.c.st, 34) == 0 or at(self.c.st, 34) == data[i] as Int + 1
                     return false
             write_reg(self.c, r, data[i] as Int)
             r = r + 1
@@ -189,7 +189,9 @@ impl Lsm6dsoPort for Dut
 
 @tier(app)
 fn dut(c: Part) -> Dut
-    Dut { bus: FakeI2c { c: c }, pins: FakePins { levels: HashMap.new() }, w: dev_bus.wiring_i2c(0, 0x6A) }
+    Dut { bus: FakeI2c { c: c },
+        pins: FakePins { levels: HashMap.new() },
+        w: dev_bus.wiring_i2c(0, 0x6A) }
 
 // The entry of a write in a bank.
 @tier(app)
@@ -532,7 +534,13 @@ fn test_a_list_of_writes_is_written_in_order_through_the_banks_it_names() [io, h
     let c = part()
     let d = dut(c)
     test.assert_eq(lsm6dsox.conf_load(d, [0x1000, 0x0180, 0x0D01, 0x6005, 0x0100, 0x1010]), 6)
-    wlog_is(c, [e(0, 0x10, 0x00), e(0, 0x01, 0x80), e(2, 0x0D, 0x01), e(2, 0x60, 0x05), e(2, 0x01, 0x00), e(0, 0x10, 0x10), e(0, 0x01, 0x00)])
+    wlog_is(c, [e(0, 0x10, 0x00),
+        e(0, 0x01, 0x80),
+        e(2, 0x0D, 0x01),
+        e(2, 0x60, 0x05),
+        e(2, 0x01, 0x00),
+        e(0, 0x10, 0x10),
+        e(0, 0x01, 0x00)])
     test.assert_eq(at(c.emb, 0x0D), 1)
     test.assert_eq(at(c.user, 0x10), 0x10)
     test.assert_eq(bank_of(c), 0)
@@ -698,7 +706,7 @@ fn test_a_part_that_was_brought_up_takes_a_file() [io, hw, fs]
 fn scan(text: Str) -> [Int]
     var out: [Int] = []
     var pos = 0
-    for _i in 0..(str.len(text) + 2)
+    for _i in 0..str.len(text) + 2
         let r = lsm6dsox_ucf.ucf_next(text, var pos)
         list.push(out, r)
         if r < 0

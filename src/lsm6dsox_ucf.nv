@@ -119,7 +119,7 @@ pub fn ucf_next(text: Str, var pos: Int) -> Int
     var i = pos
     var result = UCF_END
     pos = n
-    for _line in 0..(n + 1)
+    for _line in 0..n + 1
         let j = skip_blank(text, i)
         let c = at(text, j)
         if c == -1
@@ -146,7 +146,7 @@ pub fn ucf_next(text: Str, var pos: Int) -> Int
 pub fn ucf_count(text: Str) -> Int
     var pos = 0
     var count = 0
-    for _i in 0..(str.len(text) + 1)
+    for _i in 0..str.len(text) + 1
         let e = ucf_next(text, var pos)
         if e == UCF_END
             break
@@ -195,7 +195,7 @@ fn label_in(text: Str, a: Int, e: Int, v: Int) -> Int
             break
         i = i + 1
     var found = -1
-    for _item in 0..(e - a + 1)
+    for _item in 0..e - a + 1
         if i >= e
             break
         let ds = i + 1
@@ -230,7 +230,7 @@ pub fn ucf_label_at(text: Str, tree: Int, v: Int) -> Int
     if tree >= 0 and tree <= 7
         let n = str.len(text)
         var i = 0
-        for _line in 0..(n + 1)
+        for _line in 0..n + 1
             let j = skip_blank(text, i)
             if at(text, j) == -1
                 break

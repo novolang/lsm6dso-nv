@@ -79,33 +79,33 @@ use lsm6dso.{ Lsm6dsoPort, Lsm6dso, Lsm6dsoSpi }
 use lsm6dsox_ucf
 
 // The registers of the user bank.
-let FUNC_CFG_ACCESS = 0x01
+let FUNC_CFG_ACCESS   = 0x01
 let FSM_STATUS_A_MAIN = 0x36
-let MLC_STATUS_MAIN = 0x38
-let MD1_CFG = 0x5E
-let MD2_CFG = 0x5F
+let MLC_STATUS_MAIN   = 0x38
+let MD1_CFG           = 0x5E
+let MD2_CFG           = 0x5F
 
 // The registers of the embedded functions bank.
-let EMB_FUNC_EN_B = 0x05
-let FSM_INT1_A = 0x0B
-let MLC_INT1 = 0x0D
-let FSM_INT2_A = 0x0F
-let MLC_INT2 = 0x11
-let FSM_ENABLE_A = 0x46
-let FSM_OUTS1 = 0x4C
+let EMB_FUNC_EN_B      = 0x05
+let FSM_INT1_A         = 0x0B
+let MLC_INT1           = 0x0D
+let FSM_INT2_A         = 0x0F
+let MLC_INT2           = 0x11
+let FSM_ENABLE_A       = 0x46
+let FSM_OUTS1          = 0x4C
 let EMB_FUNC_ODR_CFG_B = 0x5F
 let EMB_FUNC_ODR_CFG_C = 0x60
-let EMB_FUNC_INIT_B = 0x67
-let MLC0_SRC = 0x70
+let EMB_FUNC_INIT_B    = 0x67
+let MLC0_SRC           = 0x70
 
 // The bits.
 let ACCESS_MASK = 0xC0
-let EN_B_FSM = 0x01
-let EN_B_MLC = 0x10
-let INIT_B_FSM = 0x01
-let INIT_B_MLC = 0x10
+let EN_B_FSM    = 0x01
+let EN_B_MLC    = 0x10
+let INIT_B_FSM  = 0x01
+let INIT_B_MLC  = 0x10
 let MD_EMB_FUNC = 0x02
-let ODR_B_BASE = 0x43
+let ODR_B_BASE  = 0x43
 
 // The register banks FUNC_CFG_ACCESS selects.
 pub const BANK_USER = 0
@@ -205,7 +205,7 @@ pub fn fsm_odr_read<P: Lsm6dsoPort>(p: P) -> Int [hw]
     var b: DevBytes = Vec.new()
     if not emb_read(p, EMB_FUNC_ODR_CFG_B, 1, var b)
         return -1
-    emb_odr_mhz((b[0] as Int) >> 3)
+    emb_odr_mhz(b[0] as Int >> 3)
 
 // Sets the rate of the machine learning core as `fsm_odr_write` does for the
 // FSM: the slowest of 12.5, 26, 52 and 104 Hz at or above `mhz`, answered in
@@ -221,7 +221,7 @@ pub fn mlc_odr_read<P: Lsm6dsoPort>(p: P) -> Int [hw]
     var b: DevBytes = Vec.new()
     if not emb_read(p, EMB_FUNC_ODR_CFG_C, 1, var b)
         return -1
-    emb_odr_mhz(((b[0] as Int) >> 4) & 3)
+    emb_odr_mhz((b[0] as Int >> 4) & 3)
 
 // ── The finite state machine ─────────────────────────────────────────
 
@@ -247,7 +247,7 @@ pub fn fsm_enabled<P: Lsm6dsoPort>(p: P) -> Int [hw]
     var b: DevBytes = Vec.new()
     if not emb_read(p, FSM_ENABLE_A, 2, var b)
         return -1
-    (b[0] as Int) | ((b[1] as Int) << 8)
+    b[0] as Int | (b[1] as Int << 8)
 
 // Asks for the FSM to start from its initial state: sets FSM_INIT.  The bit
 // is a request and does not read back.
@@ -278,7 +278,7 @@ pub fn fsm_status<P: Lsm6dsoPort>(p: P) -> Int [hw]
     var b: DevBytes = Vec.new()
     if not p.read_regs(FSM_STATUS_A_MAIN, 2, var b)
         return -1
-    (b[0] as Int) | ((b[1] as Int) << 8)
+    b[0] as Int | (b[1] as Int << 8)
 
 // Routes the interrupt of the programs in `mask` to the pin `pin`, 1 or 2:
 // FSM_INT1_A and FSM_INT1_B, or FSM_INT2_A and FSM_INT2_B, and INT1_EMB_FUNC
@@ -317,7 +317,7 @@ pub fn mlc_enabled<P: Lsm6dsoPort>(p: P) -> ?Bool [hw]
     var b: DevBytes = Vec.new()
     if not emb_read(p, EMB_FUNC_EN_B, 1, var b)
         return None
-    Some(((b[0] as Int) & EN_B_MLC) != 0)
+    Some((b[0] as Int & EN_B_MLC) != 0)
 
 // Asks for the decision trees to start from their initial state: sets
 // MLC_INIT.  The bit is a request and does not read back.
@@ -419,7 +419,7 @@ pub fn conf_load_text<P: Lsm6dsoPort>(p: P, text: Str) -> Int [hw]
     var done = 0
     var ok = true
     var bad = false
-    for _i in 0..(str.len(text) + 1)
+    for _i in 0..str.len(text) + 1
         if ok and not bad
             let e = lsm6dsox_ucf.ucf_next(text, var pos)
             if e == lsm6dsox_ucf.UCF_BAD

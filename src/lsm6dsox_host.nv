@@ -13,12 +13,12 @@ use lsm6dsox_ucf
 // The register writes of `text`, in order, each as `(address << 8) | value`;
 // `None` when a line is none of the three kinds the reader knows (blank,
 // comment, entry), in which case `ucf_error_line` says which.
-@tier(app)
-pub fn ucf_parse(text: Str) -> ?[Int]
+pub @tier(app)
+fn ucf_parse(text: Str) -> ?[Int]
     var out: [Int] = []
     var pos = 0
     var good = true
-    for _i in 0..(str.len(text) + 1)
+    for _i in 0..str.len(text) + 1
         let e = lsm6dsox_ucf.ucf_next(text, var pos)
         if e == lsm6dsox_ucf.UCF_END
             break
@@ -32,11 +32,11 @@ pub fn ucf_parse(text: Str) -> ?[Int]
 
 // The line number, from 1, of the first line of `text` that is none of the
 // three kinds, or 0 when there is none.
-@tier(app)
-pub fn ucf_error_line(text: Str) -> Int
+pub @tier(app)
+fn ucf_error_line(text: Str) -> Int
     var pos = 0
     var line = 0
-    for _i in 0..(str.len(text) + 1)
+    for _i in 0..str.len(text) + 1
         let e = lsm6dsox_ucf.ucf_next(text, var pos)
         if e == lsm6dsox_ucf.UCF_END
             break
@@ -48,8 +48,8 @@ pub fn ucf_error_line(text: Str) -> Int
 // The register writes of `text` as the lines of a `.ucf` file: `Ac`, the
 // address and the value in upper-case hexadecimal.  Reading the text back
 // gives the list it came from.
-@tier(app)
-pub fn ucf_text(writes: [Int]) -> Str
+pub @tier(app)
+fn ucf_text(writes: [Int]) -> Str
     let hex = "0123456789ABCDEF"
     var out = ""
     for w in writes
