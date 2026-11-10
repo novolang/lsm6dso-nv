@@ -1,0 +1,97 @@
+// mlc_activity — loads one of ST's published activity-recognition
+// configurations into an LSM6DSOX and prints the class its machine learning
+// core finds, for an nRF52840 DK or an nRF54LM20 DK.
+//
+// The breakout's SDA and SCL go to the board's I2C pins, its CS pin to the
+// supply, which selects I2C, and its SDO/SA0 pin to ground, which puts the
+// part at 0x6A.  The part must be an LSM6DSOX: it answers 0x6C like the
+// LSM6DSO, so the program declares it.  The program waits the 35 ms the part
+// takes to turn on, brings it up, writes the 773 register writes of ST's
+// "Activity recognition for mobile" file (accelerometer at 26 Hz and ±4 g,
+// one decision tree of about 120 nodes on windows of 75 samples), and then
+// prints a line each time the tree's output changes, about every three
+// seconds:
+//
+//     lsm6dsox: loaded 773 writes
+//     class Stationary
+//     class Walking
+//
+// The text of the file is a package asset, `st_ucf.activity`, which the
+// scratch package of `tests/device_build.sh` declares, so the file sits in the
+// image's flash as it is and the scanner reads it there: nothing is copied or
+// allocated.  The class names are from the comment at the top of the file.
+//
+// Build it with `bash tests/device_build.sh`.
+
+use embedded_hal.{ BoardI2c, BoardGpio }
+use dev_bus
+use lsm6dso
+use lsm6dso.{ Lsm6dso }
+use lsm6dsox
+use lsm6dsox.{ Lsm6dsox }
+use lsm6dsox_ucf
+use st_ucf
+
+// The part's address with the SDO/SA0 pin low.
+const ADDR = 0x6A
+
+// The tree whose output is the class: MLC0_SRC.
+const TREE = 0
+
+// Writes `n`, 0 or more, in decimal.  Formatting into a string would
+// allocate, which @tier(embedded) refuses, so each digit goes out as a
+// byte.  An Int has at most 19 decimal digits, which bounds both loops.
+@tier(embedded)
+fn digits(n: Int) [hw]
+    var div = 1
+    for _k in 0..18
+        if div <= n / 10
+            div = div * 10
+    for _k in 0..19
+        if div > 0
+            hal.uart.write_byte(48 + (n / div) % 10)
+            div = div / 10
+
+// Writes the label that starts at `start` of the file's text, a byte at a
+// time, up to its closing quote.
+@tier(embedded)
+fn label(text: Str, start: Int) [hw]
+    let n = lsm6dsox_ucf.ucf_label_len(text, start)
+    for i in 0..n
+        hal.uart.write_byte(str.byte_at_or(text, start + i, 63))
+
+// Writes the line for the class `v`: its name from the file, or its number
+// when the file names none.
+@tier(embedded)
+fn report(v: Int) [hw]
+    hal.uart.write("class ")
+    let at = lsm6dsox_ucf.ucf_label_at(st_ucf.activity, TREE, v)
+    if at >= 0
+        label(st_ucf.activity, at)
+    else
+        digits(v)
+    hal.uart.write("\n")
+
+@tier(embedded)
+fn main() [hw]
+    bsp.board.init()
+    let part = Lsm6dso.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
+    let x = Lsm6dsox.declare(part)
+    hal.timer.delay_ms(35)
+    if not part.begin()
+        hal.uart.write("lsm6dsox: no answer\n")
+        return
+    let n = x.load_text(st_ucf.activity)
+    if n < 0
+        hal.uart.write("lsm6dsox: configuration refused\n")
+        return
+    hal.uart.write("lsm6dsox: loaded ")
+    digits(n)
+    hal.uart.write(" writes\n")
+    while true
+        let changed = x.mlc_changed()
+        if changed >= 0 and (changed & 1) != 0
+            let v = x.mlc_output(TREE)
+            if v >= 0
+                report(v)
+        hal.timer.delay_ms(100)

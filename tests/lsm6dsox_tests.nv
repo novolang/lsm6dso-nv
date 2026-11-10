@@ -1,0 +1,858 @@
+// lsm6dsox_tests — the embedded functions of the LSM6DSOX over a double of the
+// part: a user bank and an embedded functions bank behind FUNC_CFG_ACCESS
+// (ST's lsm6dsox_reg.h, `LSM6DSOX_FUNC_CFG_ACCESS`), a log of every write
+// with the bank it landed in, and the `.ucf` files of ST's repository
+// (`tests/data`) read by the scanner and written to the double register by
+// register.
+//
+// The double's state `st`:
+//   4 1 when a part is there         30 the register whose writes are refused,
+//   plus one; 34 the value refused, plus one, or 0 for any value; 31 the
+//   register whose reads are refused, plus one; 99 the writes in the log.
+//   A log entry is `(bank << 16) | (register << 8) | value`.
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use lsm6dso
+use lsm6dso.{ Lsm6dso, Lsm6dsoSpi, Lsm6dsoPort }
+use lsm6dsox
+use lsm6dsox.{ Lsm6dsox, Lsm6dsoxSpi }
+use lsm6dsox_ucf
+use lsm6dsox_host
+
+// ── The double ───────────────────────────────────────────────────────
+
+struct Part
+    user: HashMap<Int, Int>
+    emb: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    wlog: HashMap<Int, Int>
+
+@tier(app)
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// The part as a reset leaves it: WHO_AM_I and the address increment.
+@tier(app)
+fn reset(c: Part)
+    c.user.clear()
+    c.emb.clear()
+    c.user.insert(0x0F, 0x6C)
+    c.user.insert(0x12, 0x04)
+    c.user.insert(0x18, 0xE0)
+
+@tier(app)
+fn part() -> Part
+    let c = Part { user: HashMap.new(), emb: HashMap.new(), st: HashMap.new(), wlog: HashMap.new() }
+    reset(c)
+    c.st.insert(4, 1)
+    c
+
+// The bank FUNC_CFG_ACCESS selects.
+@tier(app)
+fn bank_of(c: Part) -> Int
+    (at(c.user, 0x01) >> 6) & 3
+
+@tier(app)
+fn read_reg(c: Part, r: Int) -> Int
+    if r == 0x01
+        return at(c.user, 0x01)
+    let b = bank_of(c)
+    if b == 2
+        return at(c.emb, r)
+    if b == 1
+        return 0
+    at(c.user, r)
+
+@tier(app)
+fn write_reg(c: Part, r: Int, v: Int)
+    let n = at(c.st, 99)
+    c.wlog.insert(n, (bank_of(c) << 16) | (r << 8) | (v & 0xFF))
+    c.st.insert(99, n + 1)
+    if r == 0x01
+        c.user.insert(0x01, v & 0xFF)
+        return
+    let b = bank_of(c)
+    if b == 2
+        // The initialisation requests do not read back.
+        if r != 0x67
+            c.emb.insert(r, v & 0xFF)
+        return
+    if b == 1
+        return
+    if r == 0x12 and (v & 1) != 0
+        reset(c)
+        return
+    c.user.insert(r, v & 0xFF)
+
+// The writes in the log, as entries.
+@tier(app)
+fn wlog_list(c: Part) -> [Int]
+    var out: [Int] = []
+    for i in 0..at(c.st, 99)
+        list.push(out, at(c.wlog, i))
+    out
+
+@tier(app)
+fn wlog_clear(c: Part)
+    c.st.insert(99, 0)
+
+// Asserts the log holds exactly `want`, then empties it.
+@tier(app)
+fn wlog_is(c: Part, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.wlog, i), want[i])
+    wlog_clear(c)
+
+struct FakeI2c
+    c: Part
+
+impl I2cBus for FakeI2c
+    @tier(app)
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(22, freq)
+
+    @tier(app)
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != 0x6A or at(self.c.st, 4) == 0 or data.len() < 2
+            return false
+        var r = data[0] as Int
+        for i in 1..data.len()
+            if at(self.c.st, 30) == r + 1
+                if at(self.c.st, 34) == 0 or at(self.c.st, 34) == (data[i] as Int) + 1
+                    return false
+            write_reg(self.c, r, data[i] as Int)
+            r = r + 1
+        true
+
+    @tier(app)
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != 0x6A or at(self.c.st, 4) == 0
+            return None
+        var r = tx[0] as Int
+        var out: [u8] = []
+        for _i in 0..n
+            if at(self.c.st, 31) == r + 1
+                return None
+            list.push(out, read_reg(self.c, r) as u8)
+            r = r + 1
+        Some(out)
+
+struct FakePins
+    levels: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    @tier(app)
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.levels.insert(pin, dir)
+
+    @tier(app)
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+
+    @tier(app)
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+// The port over the double.
+struct Dut
+    bus: FakeI2c
+    pins: FakePins
+    w: DeviceWiring
+
+impl Lsm6dsoPort for Dut
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        lsm6dso.i2c_setup(self.bus, self.pins, self.w)
+
+    @tier(app)
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        lsm6dso.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    @tier(app)
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        lsm6dso.i2c_write(self.bus, self.w, reg, v)
+
+    @tier(app)
+    fn irq_level(self) -> Int [hw]
+        0
+
+    @tier(app)
+    fn on_spi(self) -> Bool [hw]
+        false
+
+@tier(app)
+fn dut(c: Part) -> Dut
+    Dut { bus: FakeI2c { c: c }, pins: FakePins { levels: HashMap.new() }, w: dev_bus.wiring_i2c(0, 0x6A) }
+
+// The entry of a write in a bank.
+@tier(app)
+fn e(bank: Int, reg: Int, v: Int) -> Int
+    (bank << 16) | (reg << 8) | v
+
+// The text of a file of `tests/data`.
+@tier(app)
+fn ucf(name: Str) -> Str [fs]
+    fs.read("tests/data/${name}") ?? ""
+
+// ── The banks ────────────────────────────────────────────────────────
+
+@test
+fn test_the_bank_register_selects_the_bank_and_keeps_the_ois_bit() [io, hw]
+    let c = part()
+    let d = dut(c)
+    c.user.insert(0x01, 0x01)
+    test.assert(lsm6dsox.bank_set(d, lsm6dsox.BANK_EMBEDDED))
+    test.assert_eq(at(c.user, 0x01), 0x81)
+    test.assert_eq(lsm6dsox.bank_get(d), 2)
+    test.assert(lsm6dsox.bank_set(d, lsm6dsox.BANK_SENSOR_HUB))
+    test.assert_eq(at(c.user, 0x01), 0x41)
+    test.assert_eq(lsm6dsox.bank_get(d), 1)
+    test.assert(lsm6dsox.bank_set(d, lsm6dsox.BANK_USER))
+    test.assert_eq(at(c.user, 0x01), 0x01)
+    test.assert_eq(lsm6dsox.bank_get(d), 0)
+
+@test
+fn test_a_bank_that_is_none_is_refused_and_a_bad_reading_is_minus_one() [io, hw]
+    let c = part()
+    let d = dut(c)
+    test.assert(not lsm6dsox.bank_set(d, 3))
+    test.assert(not lsm6dsox.bank_set(d, -1))
+    test.assert_eq(at(c.st, 99), 0)
+    c.user.insert(0x01, 0xC0)
+    test.assert_eq(lsm6dsox.bank_get(d), -1)
+    c.user.insert(0x01, 0x00)
+    c.st.insert(31, 0x01 + 1)
+    test.assert_eq(lsm6dsox.bank_get(d), -1)
+    test.assert(not lsm6dsox.bank_set(d, 2))
+
+@test
+fn test_a_visit_to_the_embedded_bank_puts_the_user_bank_back() [io, hw]
+    let c = part()
+    let d = dut(c)
+    c.emb.insert(0x70, 5)
+    var b: DevBytes = Vec.new()
+    test.assert(lsm6dsox.emb_read(d, 0x70, 1, var b))
+    test.assert_eq(b[0] as Int, 5)
+    test.assert_eq(bank_of(c), 0)
+    test.assert(lsm6dsox.emb_write(d, 0x0D, 0x01))
+    test.assert_eq(at(c.emb, 0x0D), 1)
+    test.assert_eq(at(c.user, 0x0D), 0)
+    test.assert(lsm6dsox.emb_update(d, 0x05, 0x10, 0x10))
+    test.assert(lsm6dsox.emb_update(d, 0x05, 0x01, 0x01))
+    test.assert_eq(at(c.emb, 0x05), 0x11)
+    wlog_is(c, [e(0, 0x01, 0x80), e(2, 0x01, 0x00),
+                e(0, 0x01, 0x80), e(2, 0x0D, 0x01), e(2, 0x01, 0x00),
+                e(0, 0x01, 0x80), e(2, 0x05, 0x10), e(2, 0x01, 0x00),
+                e(0, 0x01, 0x80), e(2, 0x05, 0x11), e(2, 0x01, 0x00)])
+
+@test
+fn test_a_failed_visit_still_puts_the_user_bank_back_and_says_so() [io, hw]
+    let c = part()
+    let d = dut(c)
+    var b: DevBytes = Vec.new()
+    // The read in the bank fails.
+    c.st.insert(31, 0x70 + 1)
+    test.assert(not lsm6dsox.emb_read(d, 0x70, 1, var b))
+    test.assert_eq(bank_of(c), 0)
+    c.st.insert(31, 0)
+    // The write in the bank fails.
+    c.st.insert(30, 0x0D + 1)
+    test.assert(not lsm6dsox.emb_write(d, 0x0D, 1))
+    test.assert_eq(bank_of(c), 0)
+    test.assert(not lsm6dsox.emb_update(d, 0x0D, 1, 1))
+    test.assert_eq(bank_of(c), 0)
+    c.st.insert(30, 0)
+    // Entering the bank fails: the restore is tried anyway.
+    wlog_clear(c)
+    c.st.insert(30, 0x01 + 1)
+    c.st.insert(34, 0x80 + 1)
+    test.assert(not lsm6dsox.emb_read(d, 0x70, 1, var b))
+    test.assert(not lsm6dsox.emb_write(d, 0x0D, 1))
+    test.assert(not lsm6dsox.emb_update(d, 0x0D, 1, 1))
+    test.assert_eq(bank_of(c), 0)
+    // Leaving the bank fails: the work is reported as failed.
+    c.st.insert(34, 0x00 + 1)
+    c.st.insert(30, 0x01 + 1)
+    c.emb.insert(0x70, 5)
+    c.user.insert(0x01, 0x00)
+    test.assert(not lsm6dsox.emb_read(d, 0x70, 1, var b))
+    test.assert_eq(bank_of(c), 2)
+
+// ── The rates ────────────────────────────────────────────────────────
+
+@test
+fn test_the_rate_codes_of_the_embedded_functions() [io, hw]
+    test.assert_eq(lsm6dsox.emb_odr_mhz(0), 12500)
+    test.assert_eq(lsm6dsox.emb_odr_mhz(1), 26000)
+    test.assert_eq(lsm6dsox.emb_odr_mhz(2), 52000)
+    test.assert_eq(lsm6dsox.emb_odr_mhz(3), 104000)
+    test.assert_eq(lsm6dsox.emb_odr_mhz(7), 104000)
+    test.assert_eq(lsm6dsox.emb_odr_code(0), 0)
+    test.assert_eq(lsm6dsox.emb_odr_code(12500), 0)
+    test.assert_eq(lsm6dsox.emb_odr_code(12501), 1)
+    test.assert_eq(lsm6dsox.emb_odr_code(26000), 1)
+    test.assert_eq(lsm6dsox.emb_odr_code(40000), 2)
+    test.assert_eq(lsm6dsox.emb_odr_code(52000), 2)
+    test.assert_eq(lsm6dsox.emb_odr_code(60000), 3)
+    test.assert_eq(lsm6dsox.emb_odr_code(900000), 3)
+
+@test
+fn test_the_fsm_rate_writes_the_reserved_bits_as_st_does() [io, hw]
+    let c = part()
+    let d = dut(c)
+    test.assert_eq(lsm6dsox.fsm_odr_write(d, 26000), 26000)
+    test.assert_eq(at(c.emb, 0x5F), 0x4B)
+    test.assert_eq(lsm6dsox.fsm_odr_read(d), 26000)
+    test.assert_eq(lsm6dsox.fsm_odr_write(d, 100000), 104000)
+    test.assert_eq(at(c.emb, 0x5F), 0x5B)
+    test.assert_eq(lsm6dsox.fsm_odr_write(d, 1), 12500)
+    test.assert_eq(at(c.emb, 0x5F), 0x43)
+    test.assert_eq(lsm6dsox.fsm_odr_read(d), 12500)
+    c.st.insert(30, 0x5F + 1)
+    test.assert_eq(lsm6dsox.fsm_odr_write(d, 26000), -1)
+    c.st.insert(30, 0)
+    c.st.insert(31, 0x5F + 1)
+    test.assert_eq(lsm6dsox.fsm_odr_read(d), -1)
+
+@test
+fn test_the_mlc_rate_keeps_the_other_bits_of_its_register() [io, hw]
+    let c = part()
+    let d = dut(c)
+    c.emb.insert(0x60, 0xC5)
+    test.assert_eq(lsm6dsox.mlc_odr_write(d, 52000), 52000)
+    test.assert_eq(at(c.emb, 0x60), 0xE5)
+    test.assert_eq(lsm6dsox.mlc_odr_read(d), 52000)
+    test.assert_eq(lsm6dsox.mlc_odr_write(d, 0), 12500)
+    test.assert_eq(at(c.emb, 0x60), 0xC5)
+    c.st.insert(30, 0x60 + 1)
+    test.assert_eq(lsm6dsox.mlc_odr_write(d, 26000), -1)
+    c.st.insert(30, 0)
+    c.st.insert(31, 0x60 + 1)
+    test.assert_eq(lsm6dsox.mlc_odr_read(d), -1)
+
+// ── The finite state machine ─────────────────────────────────────────
+
+@test
+fn test_enabling_programs_sets_the_two_masks_and_the_machine() [io, hw]
+    let c = part()
+    let d = dut(c)
+    c.emb.insert(0x05, 0x10)
+    test.assert(lsm6dsox.fsm_enable(d, 0x8003))
+    test.assert_eq(at(c.emb, 0x46), 0x03)
+    test.assert_eq(at(c.emb, 0x47), 0x80)
+    test.assert_eq(at(c.emb, 0x05), 0x11)
+    test.assert_eq(lsm6dsox.fsm_enabled(d), 0x8003)
+    test.assert(lsm6dsox.fsm_enable(d, 0))
+    test.assert_eq(at(c.emb, 0x05), 0x10)
+    test.assert_eq(lsm6dsox.fsm_enabled(d), 0)
+    test.assert_eq(bank_of(c), 0)
+
+@test
+fn test_enabling_programs_stops_at_each_refused_write() [io, hw]
+    for r in [0x46, 0x47, 0x05]
+        let c = part()
+        let d = dut(c)
+        c.st.insert(30, r + 1)
+        test.assert(not lsm6dsox.fsm_enable(d, 0x0101))
+        test.assert_eq(bank_of(c), 0)
+    let c2 = part()
+    c2.st.insert(31, 0x46 + 1)
+    test.assert_eq(lsm6dsox.fsm_enabled(dut(c2)), -1)
+
+@test
+fn test_the_fsm_init_request_is_written_and_not_read_back() [io, hw]
+    let c = part()
+    let d = dut(c)
+    test.assert(lsm6dsox.fsm_init(d))
+    wlog_is(c, [e(0, 0x01, 0x80), e(2, 0x67, 0x01), e(2, 0x01, 0x00)])
+    c.st.insert(30, 0x67 + 1)
+    test.assert(not lsm6dsox.fsm_init(d))
+    test.assert_eq(bank_of(c), 0)
+    c.st.insert(30, 0x01 + 1)
+    c.st.insert(34, 0x80 + 1)
+    test.assert(not lsm6dsox.fsm_init(d))
+
+@test
+fn test_the_fsm_outputs_are_sixteen_bytes_from_fsm_outs1() [io, hw]
+    let c = part()
+    let d = dut(c)
+    for i in 0..16
+        c.emb.insert(0x4C + i, 0x10 + i)
+    var b: DevBytes = Vec.new()
+    test.assert(lsm6dsox.fsm_outs(d, var b))
+    test.assert_eq(b.len(), 16)
+    test.assert_eq(b[0] as Int, 0x10)
+    test.assert_eq(b[15] as Int, 0x1F)
+    test.assert_eq(lsm6dsox.fsm_out(d, 1), 0x10)
+    test.assert_eq(lsm6dsox.fsm_out(d, 16), 0x1F)
+    test.assert_eq(lsm6dsox.fsm_out(d, 0), -1)
+    test.assert_eq(lsm6dsox.fsm_out(d, 17), -1)
+    c.st.insert(31, 0x4D + 1)
+    test.assert_eq(lsm6dsox.fsm_out(d, 2), -1)
+    test.assert(not lsm6dsox.fsm_outs(d, var b))
+
+@test
+fn test_the_fsm_status_is_read_in_the_user_bank_without_a_bank_change() [io, hw]
+    let c = part()
+    let d = dut(c)
+    c.user.insert(0x36, 0x05)
+    c.user.insert(0x37, 0x80)
+    test.assert_eq(lsm6dsox.fsm_status(d), 0x8005)
+    test.assert_eq(at(c.st, 99), 0)
+    c.st.insert(31, 0x36 + 1)
+    test.assert_eq(lsm6dsox.fsm_status(d), -1)
+
+@test
+fn test_fsm_interrupts_go_to_the_pins_registers_and_set_the_pins_embedded_bit() [io, hw]
+    let c = part()
+    let d = dut(c)
+    test.assert(lsm6dsox.fsm_route_int(d, 1, 0x0102))
+    test.assert_eq(at(c.emb, 0x0B), 0x02)
+    test.assert_eq(at(c.emb, 0x0C), 0x01)
+    test.assert_eq(at(c.user, 0x5E), 0x02)
+    test.assert(lsm6dsox.fsm_route_int(d, 2, 0x0004))
+    test.assert_eq(at(c.emb, 0x0F), 0x04)
+    test.assert_eq(at(c.emb, 0x10), 0x00)
+    test.assert_eq(at(c.user, 0x5F), 0x02)
+    // A mask of 0 clears the routing and leaves the pin's bit.
+    test.assert(lsm6dsox.fsm_route_int(d, 1, 0))
+    test.assert_eq(at(c.emb, 0x0B), 0)
+    test.assert_eq(at(c.user, 0x5E), 0x02)
+    test.assert(not lsm6dsox.fsm_route_int(d, 0, 1))
+    test.assert(not lsm6dsox.fsm_route_int(d, 3, 1))
+
+@test
+fn test_fsm_routing_stops_at_each_refused_write() [io, hw]
+    for r in [0x0B, 0x0C, 0x5E]
+        let c = part()
+        let d = dut(c)
+        c.st.insert(30, r + 1)
+        test.assert(not lsm6dsox.fsm_route_int(d, 1, 0x0101))
+        test.assert_eq(bank_of(c), 0)
+
+// ── The machine learning core ────────────────────────────────────────
+
+@test
+fn test_the_mlc_is_switched_with_one_bit_of_en_b() [io, hw]
+    let c = part()
+    let d = dut(c)
+    c.emb.insert(0x05, 0x01)
+    test.assert(lsm6dsox.mlc_enable(d, true))
+    test.assert_eq(at(c.emb, 0x05), 0x11)
+    test.assert(lsm6dsox.mlc_enabled(d) == Some(true))
+    test.assert(lsm6dsox.mlc_enable(d, false))
+    test.assert_eq(at(c.emb, 0x05), 0x01)
+    test.assert(lsm6dsox.mlc_enabled(d) == Some(false))
+    c.st.insert(31, 0x05 + 1)
+    test.assert(lsm6dsox.mlc_enabled(d) == None)
+    c.st.insert(31, 0)
+    c.st.insert(30, 0x05 + 1)
+    test.assert(not lsm6dsox.mlc_enable(d, true))
+
+@test
+fn test_the_mlc_init_request_is_bit_4_of_init_b() [io, hw]
+    let c = part()
+    let d = dut(c)
+    test.assert(lsm6dsox.mlc_init(d))
+    wlog_is(c, [e(0, 0x01, 0x80), e(2, 0x67, 0x10), e(2, 0x01, 0x00)])
+    c.st.insert(30, 0x67 + 1)
+    test.assert(not lsm6dsox.mlc_init(d))
+    test.assert_eq(bank_of(c), 0)
+
+@test
+fn test_the_outputs_of_the_eight_trees_are_read_from_mlc0_src() [io, hw]
+    let c = part()
+    let d = dut(c)
+    for i in 0..8
+        c.emb.insert(0x70 + i, i * 3)
+    var b: DevBytes = Vec.new()
+    test.assert(lsm6dsox.mlc_outs(d, var b))
+    test.assert_eq(b.len(), 8)
+    test.assert_eq(b[7] as Int, 21)
+    test.assert_eq(lsm6dsox.mlc_out(d, 0), 0)
+    test.assert_eq(lsm6dsox.mlc_out(d, 4), 12)
+    test.assert_eq(lsm6dsox.mlc_out(d, 7), 21)
+    test.assert_eq(lsm6dsox.mlc_out(d, 8), -1)
+    test.assert_eq(lsm6dsox.mlc_out(d, -1), -1)
+    c.st.insert(31, 0x72 + 1)
+    test.assert_eq(lsm6dsox.mlc_out(d, 2), -1)
+    test.assert(not lsm6dsox.mlc_outs(d, var b))
+    test.assert_eq(bank_of(c), 0)
+
+@test
+fn test_the_mlc_status_is_read_in_the_user_bank() [io, hw]
+    let c = part()
+    let d = dut(c)
+    c.user.insert(0x38, 0x81)
+    test.assert_eq(lsm6dsox.mlc_status(d), 0x81)
+    test.assert_eq(at(c.st, 99), 0)
+    c.st.insert(31, 0x38 + 1)
+    test.assert_eq(lsm6dsox.mlc_status(d), -1)
+
+@test
+fn test_mlc_interrupts_and_the_pin_bit() [io, hw]
+    let c = part()
+    let d = dut(c)
+    test.assert(lsm6dsox.mlc_route_int(d, 1, 0x01))
+    test.assert_eq(at(c.emb, 0x0D), 0x01)
+    test.assert_eq(at(c.user, 0x5E), 0x02)
+    test.assert(lsm6dsox.mlc_route_int(d, 2, 0xFF))
+    test.assert_eq(at(c.emb, 0x11), 0xFF)
+    test.assert_eq(at(c.user, 0x5F), 0x02)
+    test.assert(lsm6dsox.mlc_route_int(d, 2, 0x100))
+    test.assert_eq(at(c.emb, 0x11), 0x00)
+    test.assert(lsm6dsox.emb_pin(d, 2, false))
+    test.assert_eq(at(c.user, 0x5F), 0x00)
+    test.assert(lsm6dsox.emb_pin(d, 1, true))
+    test.assert(lsm6dsox.emb_pin(d, 1, false))
+    test.assert_eq(at(c.user, 0x5E), 0x00)
+    test.assert(not lsm6dsox.mlc_route_int(d, 0, 1))
+    test.assert(not lsm6dsox.mlc_route_int(d, 3, 1))
+    test.assert(not lsm6dsox.emb_pin(d, 0, true))
+    test.assert(not lsm6dsox.emb_pin(d, 3, true))
+    c.st.insert(30, 0x5E + 1)
+    test.assert(not lsm6dsox.mlc_route_int(d, 1, 1))
+    c.st.insert(30, 0x0D + 1)
+    test.assert(not lsm6dsox.mlc_route_int(d, 1, 1))
+
+// A load always ends with a write of FUNC_CFG_ACCESS that selects the user
+// bank, whichever bank the file left.
+
+// ── Loading a configuration ──────────────────────────────────────────
+
+@test
+fn test_a_list_of_writes_is_written_in_order_through_the_banks_it_names() [io, hw]
+    let c = part()
+    let d = dut(c)
+    test.assert_eq(lsm6dsox.conf_load(d, [0x1000, 0x0180, 0x0D01, 0x6005, 0x0100, 0x1010]), 6)
+    wlog_is(c, [e(0, 0x10, 0x00), e(0, 0x01, 0x80), e(2, 0x0D, 0x01), e(2, 0x60, 0x05), e(2, 0x01, 0x00), e(0, 0x10, 0x10), e(0, 0x01, 0x00)])
+    test.assert_eq(at(c.emb, 0x0D), 1)
+    test.assert_eq(at(c.user, 0x10), 0x10)
+    test.assert_eq(bank_of(c), 0)
+    test.assert_eq(lsm6dsox.conf_load(d, []), 0)
+
+@test
+fn test_a_list_that_ends_in_the_embedded_bank_is_put_back_in_the_user_bank() [io, hw]
+    let c = part()
+    let d = dut(c)
+    test.assert_eq(lsm6dsox.conf_load(d, [0x0180, 0x0D01]), 2)
+    test.assert_eq(bank_of(c), 0)
+    wlog_is(c, [e(0, 0x01, 0x80), e(2, 0x0D, 0x01), e(2, 0x01, 0x00)])
+
+@test
+fn test_a_load_stops_at_a_refused_write_and_restores_the_bank() [io, hw]
+    let c = part()
+    let d = dut(c)
+    c.st.insert(30, 0x60 + 1)
+    test.assert_eq(lsm6dsox.conf_load(d, [0x0180, 0x0D01, 0x6005, 0x0E02]), -1)
+    test.assert_eq(bank_of(c), 0)
+    wlog_is(c, [e(0, 0x01, 0x80), e(2, 0x0D, 0x01), e(2, 0x01, 0x00)])
+    // A restore that fails is a failed load.
+    let c2 = part()
+    let d2 = dut(c2)
+    c2.st.insert(30, 0x01 + 1)
+    c2.st.insert(34, 0x00 + 1)
+    test.assert_eq(lsm6dsox.conf_load(d2, [0x0180, 0x0D01]), -1)
+    test.assert(not lsm6dsox.conf_write(d2, 0x0100))
+
+@test
+fn test_the_text_of_a_file_is_loaded_where_it_lies() [io, hw]
+    let c = part()
+    let d = dut(c)
+    let text = "-- a comment\n\nAc 10 00\r\nac 01 80\n  Ac\t0d  01  \nAc 01 00"
+    test.assert_eq(lsm6dsox.conf_load_text(d, text), 4)
+    wlog_is(c, [e(0, 0x10, 0x00), e(0, 0x01, 0x80), e(2, 0x0D, 0x01), e(2, 0x01, 0x00), e(0, 0x01, 0x00)])
+    test.assert_eq(lsm6dsox.conf_load_text(d, ""), 0)
+    test.assert_eq(lsm6dsox.conf_load_text(d, "-- nothing\n"), 0)
+
+@test
+fn test_a_bad_line_stops_the_text_after_the_writes_before_it() [io, hw]
+    let c = part()
+    let d = dut(c)
+    test.assert_eq(lsm6dsox.conf_load_text(d, "Ac 01 80\nAc 0D 01\nWait 10\nAc 60 05\n"), -2)
+    test.assert_eq(bank_of(c), 0)
+    wlog_is(c, [e(0, 0x01, 0x80), e(2, 0x0D, 0x01), e(2, 0x01, 0x00)])
+
+@test
+fn test_the_text_load_stops_at_a_refused_write() [io, hw]
+    let c = part()
+    let d = dut(c)
+    c.st.insert(30, 0x0D + 1)
+    test.assert_eq(lsm6dsox.conf_load_text(d, "Ac 01 80\nAc 0D 01\nAc 60 05\n"), -1)
+    test.assert_eq(bank_of(c), 0)
+    // A restore that fails is a failed load.
+    let c2 = part()
+    c2.st.insert(30, 0x01 + 1)
+    c2.st.insert(34, 0x00 + 1)
+    test.assert_eq(lsm6dsox.conf_load_text(dut(c2), "Ac 01 80\n"), -1)
+
+// ── ST's files ───────────────────────────────────────────────────────
+
+@test
+fn test_every_write_of_the_motion_intensity_file_reaches_the_part_in_order() [io, hw, fs]
+    let text = ucf("lsm6dsox_motion_intensity.ucf")
+    test.assert_eq(lsm6dsox_ucf.ucf_count(text), 97)
+    let writes = lsm6dsox_host.ucf_parse(text) ?? []
+    test.assert_eq(writes.len(), 97)
+    let c = part()
+    let d = dut(c)
+    test.assert_eq(lsm6dsox.conf_load(d, writes), 97)
+    // The writes in the log are the file's, each in the bank the file had
+    // selected when it was made, and the load adds a last write that puts
+    // the user bank back.
+    let wl = wlog_list(c)
+    test.assert_eq(wl.len(), 98)
+    var bank = 0
+    for i in 0..97
+        let w = writes[i]
+        test.assert_eq(wl[i] & 0xFFFF, w)
+        test.assert_eq(wl[i] >> 16, bank)
+        if ((w >> 8) & 0xFF) == 0x01
+            bank = ((w & 0xFF) >> 6) & 3
+    test.assert_eq(bank, 0)
+    test.assert_eq(wl[97], e(0, 0x01, 0x00))
+    test.assert_eq(bank_of(c), 0)
+    // What the file sets up, read back through the functions.
+    test.assert_eq(lsm6dsox.mlc_odr_read(d), 12500)
+    test.assert_eq(at(c.emb, 0x0D), 0x01)
+    test.assert_eq(at(c.user, 0x5E), 0x02)
+    test.assert_eq(at(c.user, 0x10), 0x10)
+    test.assert_eq(at(c.user, 0x11), 0x00)
+    test.assert_eq(at(c.emb, 0x05), 0x10)
+
+@test
+fn test_the_motion_intensity_file_loaded_as_text_writes_the_same() [io, hw, fs]
+    let text = ucf("lsm6dsox_motion_intensity.ucf")
+    let a = part()
+    test.assert_eq(lsm6dsox.conf_load_text(dut(a), text), 97)
+    let b = part()
+    test.assert_eq(lsm6dsox.conf_load(dut(b), lsm6dsox_host.ucf_parse(text) ?? []), 97)
+    let la = wlog_list(a)
+    let lb = wlog_list(b)
+    test.assert_eq(la.len(), lb.len())
+    for i in 0..la.len()
+        test.assert_eq(la[i], lb[i])
+
+@test
+fn test_the_activity_file_loads_and_names_its_classes() [io, hw, fs]
+    let text = ucf("lsm6dsox_activity_recognition_for_mobile.ucf")
+    test.assert_eq(lsm6dsox_ucf.ucf_count(text), 773)
+    let c = part()
+    let d = dut(c)
+    test.assert_eq(lsm6dsox.conf_load_text(d, text), 773)
+    test.assert_eq(bank_of(c), 0)
+    test.assert_eq(at(c.user, 0x10), 0x28)
+    test.assert_eq(at(c.user, 0x11), 0x00)
+    test.assert_eq(at(c.user, 0x5E), 0x02)
+    test.assert_eq(at(c.emb, 0x0D), 0x01)
+    test.assert_eq(lsm6dsox.mlc_odr_read(d), 26000)
+    // The classes of the comment.
+    let names = ["Stationary", "Walking", "", "", "Jogging", "", "", "", "Biking", "", "", "", "Driving"]
+    for v in 0..13
+        let at_ = lsm6dsox_ucf.ucf_label_at(text, 0, v)
+        if names[v] == ""
+            test.assert_eq(at_, -1)
+        else
+            test.assert_eq(lsm6dsox_ucf.ucf_label_len(text, at_), str.len(names[v]))
+            test.assert_eq(str.slice(text, at_, at_ + str.len(names[v])), names[v])
+    test.assert_eq(lsm6dsox_ucf.ucf_label_at(text, 0, 99), -1)
+    test.assert_eq(lsm6dsox_ucf.ucf_label_at(text, 1, 0), -1)
+
+@test
+fn test_the_fsm_file_enables_program_1_and_the_rest_is_read_back() [io, hw, fs]
+    let text = ucf("lsm6dsox_fsm.ucf")
+    test.assert_eq(lsm6dsox_ucf.ucf_count(text), 44)
+    let c = part()
+    let d = dut(c)
+    test.assert_eq(lsm6dsox.conf_load_text(d, text), 44)
+    test.assert_eq(lsm6dsox.fsm_enabled(d), 0x0001)
+    test.assert_eq(lsm6dsox.fsm_odr_read(d), 26000)
+    test.assert_eq(at(c.user, 0x5F), 0x02)
+    test.assert_eq(at(c.user, 0x10), 0x20)
+    test.assert_eq(at(c.user, 0x11), 0x20)
+    test.assert_eq(bank_of(c), 0)
+    // The file has no class names, only the programs' outputs.
+    test.assert_eq(lsm6dsox_ucf.ucf_label_at(text, 0, 0), -1)
+
+@test
+fn test_a_part_that_was_brought_up_takes_a_file() [io, hw, fs]
+    let c = part()
+    let d = dut(c)
+    c.user.insert(0x01, 0x80)
+    test.assert(lsm6dso.start(d))
+    test.assert_eq(bank_of(c), 0)
+    test.assert_eq(lsm6dsox.conf_load_text(d, ucf("lsm6dsox_motion_intensity.ucf")), 97)
+    test.assert_eq(at(c.user, 0x12) & 0x04, 0x04)
+
+// ── The scanner ──────────────────────────────────────────────────────
+
+// The entries of `text` and the answer that ended the scan.
+@tier(app)
+fn scan(text: Str) -> [Int]
+    var out: [Int] = []
+    var pos = 0
+    for _i in 0..(str.len(text) + 2)
+        let r = lsm6dsox_ucf.ucf_next(text, var pos)
+        list.push(out, r)
+        if r < 0
+            break
+    out
+
+@test
+fn test_the_scanner_reads_entries_comments_and_blank_lines() [io, hw]
+    let r = scan("-- c\n\n   \nAc 10 00\nAC 1f aB\nac\t0A\t0b\nAc 01 80 \r\n  -- another\n")
+    test.assert_eq(r.len(), 5)
+    test.assert_eq(r[0], 0x1000)
+    test.assert_eq(r[1], 0x1FAB)
+    test.assert_eq(r[2], 0x0A0B)
+    test.assert_eq(r[3], 0x0180)
+    test.assert_eq(r[4], lsm6dsox_ucf.UCF_END)
+    // No final line feed, a comment as the last line, nothing at all.
+    test.assert_eq(scan("Ac 01 80")[0], 0x0180)
+    test.assert_eq(scan("Ac 01 80")[1], lsm6dsox_ucf.UCF_END)
+    test.assert_eq(scan("Ac 01 80\n-- end")[1], lsm6dsox_ucf.UCF_END)
+    test.assert_eq(scan("")[0], lsm6dsox_ucf.UCF_END)
+    test.assert_eq(scan("\n\n")[0], lsm6dsox_ucf.UCF_END)
+    test.assert_eq(scan("   ")[0], lsm6dsox_ucf.UCF_END)
+    test.assert_eq(scan("-")[0], lsm6dsox_ucf.UCF_BAD)
+
+@test
+fn test_the_scanner_refuses_what_is_not_a_line_of_the_format() [io, hw]
+    let bad = ["Wait 10", "Ac", "Ac 10", "Ac 10 0", "Ac 1 00", "Ac 100 00", "Ac10 00", "Ac 10 00 extra", "Ac 1g 00", "Ac 10 0g",
+               "Ac 10 000", "Bc 10 00", "Ad 10 00", "A 10 00", "Ac 1000", "--x\nAc 10 00 00", "Ac 10 00;"]
+    for t in bad
+        let r = scan(t)
+        test.assert_eq(r[r.len() - 1], lsm6dsox_ucf.UCF_BAD)
+    test.assert_eq(lsm6dsox_ucf.ucf_count("Ac 10 00\nWait 10\n"), lsm6dsox_ucf.UCF_BAD)
+    test.assert_eq(lsm6dsox_ucf.ucf_count("Ac 10 00\nAc 11 00\n"), 2)
+    test.assert_eq(lsm6dsox_ucf.ucf_count(""), 0)
+
+@test
+fn test_a_bad_line_leaves_the_position_at_its_start() [io, hw]
+    let text = "Ac 10 00\n-- c\nWait 10\nAc 11 00\n"
+    var pos = 0
+    test.assert_eq(lsm6dsox_ucf.ucf_next(text, var pos), 0x1000)
+    test.assert_eq(pos, 9)
+    test.assert_eq(lsm6dsox_ucf.ucf_next(text, var pos), lsm6dsox_ucf.UCF_BAD)
+    test.assert_eq(pos, 14)
+    test.assert_eq(lsm6dsox_ucf.ucf_line_of(text, pos), 3)
+    test.assert_eq(lsm6dsox_ucf.ucf_line_of(text, 0), 1)
+    test.assert_eq(lsm6dsox_host.ucf_error_line(text), 3)
+    test.assert_eq(lsm6dsox_host.ucf_error_line("Ac 10 00\n"), 0)
+    test.assert(lsm6dsox_host.ucf_parse(text) == None)
+
+@test
+fn test_the_labels_of_a_comment_are_found_by_tree_and_value() [io, hw]
+    let t = "-- tool\n-- <MLC0_SRC>DT1,0='Stationary',1='Walking'\n  -- <MLC3_SRC>DT2,5='x y',200='z'\nAc 10 00\n"
+    let a = lsm6dsox_ucf.ucf_label_at(t, 0, 1)
+    test.assert_eq(str.slice(t, a, a + lsm6dsox_ucf.ucf_label_len(t, a)), "Walking")
+    let b = lsm6dsox_ucf.ucf_label_at(t, 3, 5)
+    test.assert_eq(str.slice(t, b, b + lsm6dsox_ucf.ucf_label_len(t, b)), "x y")
+    let c = lsm6dsox_ucf.ucf_label_at(t, 3, 200)
+    test.assert_eq(str.slice(t, c, c + lsm6dsox_ucf.ucf_label_len(t, c)), "z")
+    test.assert_eq(lsm6dsox_ucf.ucf_label_at(t, 0, 2), -1)
+    test.assert_eq(lsm6dsox_ucf.ucf_label_at(t, 1, 0), -1)
+    test.assert_eq(lsm6dsox_ucf.ucf_label_at(t, -1, 0), -1)
+    test.assert_eq(lsm6dsox_ucf.ucf_label_at(t, 8, 0), -1)
+    test.assert_eq(lsm6dsox_ucf.ucf_label_at("", 0, 0), -1)
+    // A label that ends the text, and a label cut short by the line.
+    let u = "-- <MLC1_SRC>DT1,7='end"
+    test.assert_eq(lsm6dsox_ucf.ucf_label_at(u, 1, 7), -1)
+    test.assert_eq(lsm6dsox_ucf.ucf_label_len(u, 20), 3)
+    test.assert_eq(lsm6dsox_ucf.ucf_label_len("ab\ncd", 0), 2)
+    test.assert_eq(lsm6dsox_ucf.ucf_label_len("ab", 5), 0)
+
+@test
+fn test_a_comment_that_is_not_a_list_of_labels_names_nothing() [io, hw]
+    let cases = ["-- <MLC0_SRC>", "-- <MLC0_SRC>DT1", "-- <MLC0_SRC>DT1,", "-- <MLC0_SRC>DT1,x='a'", "-- <MLC0_SRC>DT1,0=a",
+                 "-- <MLC0_SRC>DT1,0", "-- <MLC0_SRC>DT1,0='a' 1='b'", "-- <MLC0_SRC>DT1,0='a',", "-- <MLC0_SRC>DT1,0='a',1",
+                 "-- <MLC0_SRC>DT1,0='a',1=", "-- <MLC0_SRC>DT1,0='a',1='", "--<MLC0_SRC>DT1,0='a'", "-- <MLC9_SRC>DT1,0='a'",
+                 "-- <FSM_OUTS1>FSM1", "-- <MLC0_SRX>DT1,0='a'", "-- <MLC0_SRC DT1,0='a'"]
+    for t in cases
+        test.assert_eq(lsm6dsox_ucf.ucf_label_at(t, 0, 1), -1)
+    // The second pair is found when the first is well formed.
+    test.assert_eq(lsm6dsox_ucf.ucf_label_at("-- <MLC0_SRC>DT1,0='a',1='b'", 0, 1), 26)
+    test.assert_eq(lsm6dsox_ucf.ucf_label_at("--<MLC0_SRC>DT1,0='a'", 0, 0), 19)
+
+// ── The host side ────────────────────────────────────────────────────
+
+@test
+fn test_the_list_and_the_text_make_a_round_trip() [io, hw, fs]
+    let text = ucf("lsm6dsox_fsm.ucf")
+    let writes = lsm6dsox_host.ucf_parse(text) ?? []
+    test.assert_eq(writes.len(), 44)
+    test.assert_eq(writes[0], 0x1000)
+    let again = lsm6dsox_host.ucf_text(writes)
+    test.assert_eq(str.len(again), 44 * 9)
+    let back = lsm6dsox_host.ucf_parse(again) ?? []
+    test.assert_eq(back.len(), 44)
+    for i in 0..44
+        test.assert_eq(back[i], writes[i])
+    test.assert_eq(lsm6dsox_host.ucf_text([]), "")
+    test.assert_eq(lsm6dsox_host.ucf_text([0xA1F0]), "Ac A1 F0\n")
+    test.assert_eq((lsm6dsox_host.ucf_parse("") ?? [1]).len(), 0)
+
+// ── The declared types, over absent hardware ─────────────────────────
+
+@test
+fn test_the_i2c_type_over_absent_hardware() [io, hw]
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    let x = Lsm6dsox.declare(Lsm6dso.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, w))
+    var b: DevBytes = Vec.new()
+    test.assert_eq(x.load([0x0180]), -1)
+    test.assert_eq(x.load_text("Ac 01 80\n"), -1)
+    test.assert_eq(x.mlc_output(0), -1)
+    test.assert(not x.mlc_outputs(var b))
+    test.assert_eq(x.mlc_changed(), -1)
+    test.assert(not x.mlc_on(true))
+    test.assert(x.mlc_is_on() == None)
+    test.assert(not x.mlc_restart())
+    test.assert_eq(x.mlc_rate_mhz(), -1)
+    test.assert_eq(x.set_mlc_rate_mhz(26000), -1)
+    test.assert(not x.route_mlc(1, 1))
+    test.assert(not x.fsm_set_enabled(1))
+    test.assert_eq(x.fsm_enabled_mask(), -1)
+    test.assert(not x.fsm_restart())
+    test.assert_eq(x.fsm_output(1), -1)
+    test.assert(not x.fsm_outputs(var b))
+    test.assert_eq(x.fsm_changed(), -1)
+    test.assert_eq(x.fsm_rate_mhz(), -1)
+    test.assert_eq(x.set_fsm_rate_mhz(26000), -1)
+    test.assert(not x.route_fsm(1, 1))
+    test.assert(not x.set_emb_pin(1, true))
+    test.assert_eq(x.bank(), -1)
+
+@test
+fn test_the_spi_type_over_absent_hardware() [io, hw]
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    let x = Lsm6dsoxSpi.declare(Lsm6dsoSpi.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, w))
+    var b: DevBytes = Vec.new()
+    test.assert_eq(x.load([0x0180]), -1)
+    test.assert_eq(x.load_text("Ac 01 80\n"), -1)
+    test.assert_eq(x.mlc_output(0), -1)
+    test.assert(not x.mlc_outputs(var b))
+    test.assert_eq(x.mlc_changed(), -1)
+    test.assert(not x.mlc_on(true))
+    test.assert(x.mlc_is_on() == None)
+    test.assert(not x.mlc_restart())
+    test.assert_eq(x.mlc_rate_mhz(), -1)
+    test.assert_eq(x.set_mlc_rate_mhz(26000), -1)
+    test.assert(not x.route_mlc(1, 1))
+    test.assert(not x.fsm_set_enabled(1))
+    test.assert_eq(x.fsm_enabled_mask(), -1)
+    test.assert(not x.fsm_restart())
+    test.assert_eq(x.fsm_output(1), -1)
+    test.assert(not x.fsm_outputs(var b))
+    test.assert_eq(x.fsm_changed(), -1)
+    test.assert_eq(x.fsm_rate_mhz(), -1)
+    test.assert_eq(x.set_fsm_rate_mhz(26000), -1)
+    test.assert(not x.route_fsm(1, 1))
+    test.assert(not x.set_emb_pin(1, true))
+    test.assert_eq(x.bank(), -1)

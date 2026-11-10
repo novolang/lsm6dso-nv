@@ -1,0 +1,599 @@
+// lsm6dsox — the embedded functions of ST's LSM6DSOX that the LSM6DSO does
+// not have: the machine learning core (MLC), which runs decision trees on
+// the accelerometer and gyroscope data inside the sensor, and the finite
+// state machine (FSM).  Both run beside the sensor's output and leave a
+// result in registers that a host reads, or a pin that it waits on.
+//
+// The facts below are from ST's application note AN5272, "LSM6DSOX: Machine
+// Learning Core", and AN5273, "LSM6DSOX: Finite State Machine", and from
+// ST's platform-independent driver `lsm6dsox_reg` (STMicroelectronics/
+// lsm6dsox-pid, commit 2e86793125f7, `lsm6dsox_reg.h` and `.c`) and its
+// example `lsm6dsox_mlc.c` (STMems_Standard_C_drivers, commit 1f848c38e84b),
+// which is where the register addresses and the bit positions were read.
+// The two application notes could not be fetched from ST's site, whose
+// server refused the requests, so the text of them was not read; what the
+// registers do is from the driver's names and comments and from the
+// `.ucf` files of ST's repository (see `lsm6dsox_ucf`).  Nothing is ported.
+//
+// The register banks.  FUNC_CFG_ACCESS (0x01, in every bank) selects the
+// registers that addresses 0x02 and above name: bits 7:6 REG_ACCESS are 00
+// for the user bank, 01 for the sensor hub bank and 10 for the embedded
+// functions bank.  Bit 0, OIS_CTRL_FROM_UI, belongs to the OIS interface and
+// is kept as it is.  In the embedded bank:
+//
+//   0x04  EMB_FUNC_EN_A     pedometer (3), tilt (4), significant motion (5)
+//   0x05  EMB_FUNC_EN_B     FSM_EN (0), FIFO_COMPR_EN (3), MLC_EN (4)
+//   0x0A  EMB_FUNC_INT1     0x0B FSM_INT1_A (FSM1 to 8), 0x0C FSM_INT1_B
+//                           (FSM9 to 16), 0x0D MLC_INT1 (MLC1 to 8)
+//   0x0E  EMB_FUNC_INT2     0x0F FSM_INT2_A, 0x10 FSM_INT2_B, 0x11 MLC_INT2
+//   0x44  EMB_FUNC_FIFO_CFG
+//   0x46  FSM_ENABLE_A      FSM1 to FSM8, one bit each; 0x47 FSM_ENABLE_B
+//   0x4C  FSM_OUTS1         to 0x5B FSM_OUTS16, one byte for each program
+//   0x5F  EMB_FUNC_ODR_CFG_B  FSM_ODR (4:3); the other bits read 0x43
+//   0x60  EMB_FUNC_ODR_CFG_C  MLC_ODR (5:4)
+//   0x67  EMB_FUNC_INIT_B   FSM_INIT (0), FIFO_COMPR_INIT (3), MLC_INIT (4)
+//   0x70  MLC0_SRC          to 0x77 MLC7_SRC, one byte for each decision tree
+//
+// and in the user bank, whatever the bank register says:
+//
+//   0x35  EMB_FUNC_STATUS_MAINPAGE   0x36 FSM_STATUS_A_MAINPAGE (FSM1 to 8),
+//                                    0x37 FSM_STATUS_B_MAINPAGE (FSM9 to 16),
+//                                    0x38 MLC_STATUS_MAINPAGE (MLC1 to 8)
+//   0x5E  MD1_CFG   bit 1 INT1_EMB_FUNC;  0x5F MD2_CFG  bit 1 INT2_EMB_FUNC
+//
+// The programs and the trees are written through the PAGE_SEL, PAGE_ADDRESS,
+// PAGE_VALUE and PAGE_RW registers of the embedded bank, and the `.ucf`
+// file already holds those writes, in order, together with the writes that
+// enable the function and route its interrupt.  `conf_load` writes the file's
+// entries and nothing else; the registers above are for a program that
+// changes the configuration after the file, or reads the result.
+//
+// The part.  The LSM6DSO and the LSM6DSOX answer 0x6C to WHO_AM_I, so no
+// register tells them apart.  A program that has an LSM6DSOX says so with
+// `Lsm6dsox.declare(part)` or `Lsm6dsoxSpi.declare(part)`, and the functions
+// of this module are the methods of those two types.
+//
+// Fixes kept from the code read:
+//
+//   - ST's driver sets the bank, works, and sets the user bank again even
+//     when the work failed (`ret += lsm6dsox_mem_bank_set(...)`); a part left
+//     in the embedded bank answers other registers for every later read, so
+//     every function here puts the user bank back and says whether both the
+//     work and the restore succeeded.
+//   - ST's `mem_bank_set` reads FUNC_CFG_ACCESS first so the OIS bit is not
+//     lost; `bank_set` does too.
+//   - ST's `fsm_data_rate_set` writes the unused bits of EMB_FUNC_ODR_CFG_B
+//     as 3 and 2 (a byte of 0x43 with the rate), and so does `fsm_odr_write`;
+//     the `.ucf` files write 0x4B for 26 Hz.
+//   - ST's example turns the sensors off and loads the file after a software
+//     reset, and the file itself starts by writing both ODR registers to 0
+//     and ends by writing them again, which changes the rates the program had
+//     set; `conf_load` should follow `begin`, and the rates are read back
+//     with `accel_rate_mhz` and `gyro_rate_mhz`.
+//   - The example says the accelerometer's rate must be equal to or higher
+//     than the MLC's.
+
+use dev_bus.{ DevBytes }
+use lsm6dso
+use lsm6dso.{ Lsm6dsoPort, Lsm6dso, Lsm6dsoSpi }
+use lsm6dsox_ucf
+
+// The registers of the user bank.
+let FUNC_CFG_ACCESS = 0x01
+let FSM_STATUS_A_MAIN = 0x36
+let MLC_STATUS_MAIN = 0x38
+let MD1_CFG = 0x5E
+let MD2_CFG = 0x5F
+
+// The registers of the embedded functions bank.
+let EMB_FUNC_EN_B = 0x05
+let FSM_INT1_A = 0x0B
+let MLC_INT1 = 0x0D
+let FSM_INT2_A = 0x0F
+let MLC_INT2 = 0x11
+let FSM_ENABLE_A = 0x46
+let FSM_OUTS1 = 0x4C
+let EMB_FUNC_ODR_CFG_B = 0x5F
+let EMB_FUNC_ODR_CFG_C = 0x60
+let EMB_FUNC_INIT_B = 0x67
+let MLC0_SRC = 0x70
+
+// The bits.
+let ACCESS_MASK = 0xC0
+let EN_B_FSM = 0x01
+let EN_B_MLC = 0x10
+let INIT_B_FSM = 0x01
+let INIT_B_MLC = 0x10
+let MD_EMB_FUNC = 0x02
+let ODR_B_BASE = 0x43
+
+// The register banks FUNC_CFG_ACCESS selects.
+pub const BANK_USER = 0
+
+// The sensor hub bank.
+pub const BANK_SENSOR_HUB = 1
+
+// The embedded functions bank.
+pub const BANK_EMBEDDED = 2
+
+// ── The banks ────────────────────────────────────────────────────────
+
+// Selects a register bank, one of the `BANK_` values, leaving the other
+// bits of FUNC_CFG_ACCESS: whether the part took it.  A value that is none
+// of the three is refused.
+pub fn bank_set<P: Lsm6dsoPort>(p: P, bank: Int) -> Bool [hw]
+    if bank < BANK_USER or bank > BANK_EMBEDDED
+        return false
+    lsm6dso.reg_update(p, FUNC_CFG_ACCESS, ACCESS_MASK, bank << 6)
+
+// The bank in use, a `BANK_` value, or -1 when the part did not answer or
+// the bits are 11.
+pub fn bank_get<P: Lsm6dsoPort>(p: P) -> Int [hw]
+    let Some(v) = lsm6dso.reg_read(p, FUNC_CFG_ACCESS) else return -1
+    let b = (v >> 6) & 3
+    if b == 3
+        return -1
+    b
+
+// Puts the user bank back after work in another: whether both the work
+// (`ok`) and the restore succeeded.  The restore is tried even when the
+// work failed.
+fn bank_leave<P: Lsm6dsoPort>(p: P, ok: Bool) -> Bool [hw]
+    let back = bank_set(p, BANK_USER)
+    ok and back
+
+// Reads `n` registers from `reg` of the embedded functions bank into `dst`
+// (`n` at most 32), in one visit to the bank: whether it all worked.
+pub fn emb_read<P: Lsm6dsoPort>(p: P, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    var ok = bank_set(p, BANK_EMBEDDED)
+    if ok
+        ok = p.read_regs(reg, n, var dst)
+    bank_leave(p, ok)
+
+// Writes a register of the embedded functions bank and reads it back:
+// whether the part holds the value.  The bit that requests an
+// initialisation is written with `fsm_init` and `mlc_init` instead, since
+// it does not read back.
+pub fn emb_write<P: Lsm6dsoPort>(p: P, reg: Int, v: Int) -> Bool [hw]
+    var ok = bank_set(p, BANK_EMBEDDED)
+    if ok
+        ok = lsm6dso.reg_write(p, reg, v)
+    bank_leave(p, ok)
+
+// Sets the bits of `mask` in a register of the embedded functions bank to
+// those of `v`: whether the part took it.
+pub fn emb_update<P: Lsm6dsoPort>(p: P, reg: Int, mask: Int, v: Int) -> Bool [hw]
+    var ok = bank_set(p, BANK_EMBEDDED)
+    if ok
+        ok = lsm6dso.reg_update(p, reg, mask, v)
+    bank_leave(p, ok)
+
+// ── The rates ────────────────────────────────────────────────────────
+
+// The rate in thousandths of a hertz of a 2-bit rate code of the embedded
+// functions: 12.5, 26, 52 and 104 Hz.
+pub fn emb_odr_mhz(code: Int) -> Int
+    match code & 3
+        0 => 12500
+        1 => 26000
+        2 => 52000
+        _ => 104000
+
+// The code of the slowest rate at or above `mhz` thousandths of a hertz, or
+// of 104 Hz.
+pub fn emb_odr_code(mhz: Int) -> Int
+    if mhz <= 12500
+        return 0
+    if mhz <= 26000
+        return 1
+    if mhz <= 52000
+        return 2
+    3
+
+// Sets the rate of the finite state machine to the slowest of 12.5, 26, 52
+// and 104 Hz at or above `mhz` and answers it in thousandths of a hertz, or
+// -1 when the part did not take it.  The rate of the FSM and the MLC cannot
+// be higher than the accelerometer's.
+pub fn fsm_odr_write<P: Lsm6dsoPort>(p: P, mhz: Int) -> Int [hw]
+    let code = emb_odr_code(mhz)
+    if not emb_write(p, EMB_FUNC_ODR_CFG_B, ODR_B_BASE | (code << 3))
+        return -1
+    emb_odr_mhz(code)
+
+// The rate of the finite state machine in thousandths of a hertz, or -1.
+pub fn fsm_odr_read<P: Lsm6dsoPort>(p: P) -> Int [hw]
+    var b: DevBytes = Vec.new()
+    if not emb_read(p, EMB_FUNC_ODR_CFG_B, 1, var b)
+        return -1
+    emb_odr_mhz((b[0] as Int) >> 3)
+
+// Sets the rate of the machine learning core as `fsm_odr_write` does for the
+// FSM: the slowest of 12.5, 26, 52 and 104 Hz at or above `mhz`, answered in
+// thousandths of a hertz, or -1.  The other bits of the register are kept.
+pub fn mlc_odr_write<P: Lsm6dsoPort>(p: P, mhz: Int) -> Int [hw]
+    let code = emb_odr_code(mhz)
+    if not emb_update(p, EMB_FUNC_ODR_CFG_C, 0x30, code << 4)
+        return -1
+    emb_odr_mhz(code)
+
+// The rate of the machine learning core in thousandths of a hertz, or -1.
+pub fn mlc_odr_read<P: Lsm6dsoPort>(p: P) -> Int [hw]
+    var b: DevBytes = Vec.new()
+    if not emb_read(p, EMB_FUNC_ODR_CFG_C, 1, var b)
+        return -1
+    emb_odr_mhz(((b[0] as Int) >> 4) & 3)
+
+// ── The finite state machine ─────────────────────────────────────────
+
+// Enables the programs in `mask`, bit 0 for FSM1 to bit 15 for FSM16, and
+// turns the machine on when the mask has a bit set and off when it has
+// none: FSM_ENABLE_A and FSM_ENABLE_B, then FSM_EN of EMB_FUNC_EN_B.
+// Whether the part took all three.
+pub fn fsm_enable<P: Lsm6dsoPort>(p: P, mask: Int) -> Bool [hw]
+    var ok = bank_set(p, BANK_EMBEDDED)
+    if ok
+        ok = lsm6dso.reg_write(p, FSM_ENABLE_A, mask & 0xFF)
+    if ok
+        ok = lsm6dso.reg_write(p, FSM_ENABLE_A + 1, (mask >> 8) & 0xFF)
+    if ok
+        var on = 0
+        if (mask & 0xFFFF) != 0
+            on = EN_B_FSM
+        ok = lsm6dso.reg_update(p, EMB_FUNC_EN_B, EN_B_FSM, on)
+    bank_leave(p, ok)
+
+// The programs that are enabled, as the mask of `fsm_enable`, or -1.
+pub fn fsm_enabled<P: Lsm6dsoPort>(p: P) -> Int [hw]
+    var b: DevBytes = Vec.new()
+    if not emb_read(p, FSM_ENABLE_A, 2, var b)
+        return -1
+    (b[0] as Int) | ((b[1] as Int) << 8)
+
+// Asks for the FSM to start from its initial state: sets FSM_INIT.  The bit
+// is a request and does not read back.
+pub fn fsm_init<P: Lsm6dsoPort>(p: P) -> Bool [hw]
+    var ok = bank_set(p, BANK_EMBEDDED)
+    if ok
+        ok = p.write_reg(EMB_FUNC_INIT_B, INIT_B_FSM)
+    bank_leave(p, ok)
+
+// The outputs of all 16 programs, FSM_OUTS1 to FSM_OUTS16, in `dst`, which
+// holds 16 bytes afterwards: whether the read worked.
+pub fn fsm_outs<P: Lsm6dsoPort>(p: P, var dst: DevBytes) -> Bool [hw]
+    emb_read(p, FSM_OUTS1, 16, var dst)
+
+// The output of the program `n`, 1 to 16, or -1.
+pub fn fsm_out<P: Lsm6dsoPort>(p: P, n: Int) -> Int [hw]
+    if n < 1 or n > 16
+        return -1
+    var b: DevBytes = Vec.new()
+    if not emb_read(p, FSM_OUTS1 + n - 1, 1, var b)
+        return -1
+    b[0] as Int
+
+// The programs whose output changed, FSM_STATUS_A_MAINPAGE and
+// FSM_STATUS_B_MAINPAGE as one 16-bit mask like that of `fsm_enable`, or
+// -1.  The registers are in the user bank, so the bank is not touched.
+pub fn fsm_status<P: Lsm6dsoPort>(p: P) -> Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(FSM_STATUS_A_MAIN, 2, var b)
+        return -1
+    (b[0] as Int) | ((b[1] as Int) << 8)
+
+// Routes the interrupt of the programs in `mask` to the pin `pin`, 1 or 2:
+// FSM_INT1_A and FSM_INT1_B, or FSM_INT2_A and FSM_INT2_B, and INT1_EMB_FUNC
+// or INT2_EMB_FUNC of the pin's configuration register when the mask has a
+// bit set.  The pin's bit is left set when the mask is cleared, since the
+// MLC and the other embedded functions may use it; `emb_pin` clears it.
+// Whether the part took everything.
+pub fn fsm_route_int<P: Lsm6dsoPort>(p: P, pin: Int, mask: Int) -> Bool [hw]
+    if pin != 1 and pin != 2
+        return false
+    var reg = FSM_INT1_A
+    if pin == 2
+        reg = FSM_INT2_A
+    var ok = bank_set(p, BANK_EMBEDDED)
+    if ok
+        ok = lsm6dso.reg_write(p, reg, mask & 0xFF)
+    if ok
+        ok = lsm6dso.reg_write(p, reg + 1, (mask >> 8) & 0xFF)
+    ok = bank_leave(p, ok)
+    if ok and (mask & 0xFFFF) != 0
+        ok = emb_pin(p, pin, true)
+    ok
+
+// ── The machine learning core ────────────────────────────────────────
+
+// Turns the machine learning core on or off: MLC_EN of EMB_FUNC_EN_B.
+// Whether the part took it.
+pub fn mlc_enable<P: Lsm6dsoPort>(p: P, on: Bool) -> Bool [hw]
+    var v = 0
+    if on
+        v = EN_B_MLC
+    emb_update(p, EMB_FUNC_EN_B, EN_B_MLC, v)
+
+// Whether the machine learning core is on, or `None`.
+pub fn mlc_enabled<P: Lsm6dsoPort>(p: P) -> ?Bool [hw]
+    var b: DevBytes = Vec.new()
+    if not emb_read(p, EMB_FUNC_EN_B, 1, var b)
+        return None
+    Some(((b[0] as Int) & EN_B_MLC) != 0)
+
+// Asks for the decision trees to start from their initial state: sets
+// MLC_INIT.  The bit is a request and does not read back.
+pub fn mlc_init<P: Lsm6dsoPort>(p: P) -> Bool [hw]
+    var ok = bank_set(p, BANK_EMBEDDED)
+    if ok
+        ok = p.write_reg(EMB_FUNC_INIT_B, INIT_B_MLC)
+    bank_leave(p, ok)
+
+// The outputs of the eight decision trees, MLC0_SRC to MLC7_SRC, in `dst`,
+// which holds 8 bytes afterwards: whether the read worked.  A tree answers
+// the class number that the configuration gave its leaves; the `.ucf` file
+// names the classes in a comment (`ucf_label_at`).
+pub fn mlc_outs<P: Lsm6dsoPort>(p: P, var dst: DevBytes) -> Bool [hw]
+    emb_read(p, MLC0_SRC, 8, var dst)
+
+// The output of the tree `n`, 0 to 7, or -1.
+pub fn mlc_out<P: Lsm6dsoPort>(p: P, n: Int) -> Int [hw]
+    if n < 0 or n > 7
+        return -1
+    var b: DevBytes = Vec.new()
+    if not emb_read(p, MLC0_SRC + n, 1, var b)
+        return -1
+    b[0] as Int
+
+// The trees whose output changed, MLC_STATUS_MAINPAGE as a mask with bit 0
+// for the tree MLC0, or -1.  The register is in the user bank.
+pub fn mlc_status<P: Lsm6dsoPort>(p: P) -> Int [hw]
+    lsm6dso.reg_read(p, MLC_STATUS_MAIN) ?? -1
+
+// Routes the interrupt of the trees in `mask`, bit 0 for MLC0, to the pin
+// `pin`, 1 or 2: MLC_INT1 or MLC_INT2, and the pin's INT_EMB_FUNC bit when
+// the mask has a bit set, which `fsm_route_int` describes.  Whether the part
+// took everything.
+pub fn mlc_route_int<P: Lsm6dsoPort>(p: P, pin: Int, mask: Int) -> Bool [hw]
+    if pin != 1 and pin != 2
+        return false
+    var reg = MLC_INT1
+    if pin == 2
+        reg = MLC_INT2
+    var ok = emb_write(p, reg, mask & 0xFF)
+    if ok and (mask & 0xFF) != 0
+        ok = emb_pin(p, pin, true)
+    ok
+
+// Sets or clears INT1_EMB_FUNC (`pin` 1) or INT2_EMB_FUNC (`pin` 2), the bit
+// that lets the embedded functions' interrupts reach the pin: whether the
+// part took it.
+pub fn emb_pin<P: Lsm6dsoPort>(p: P, pin: Int, on: Bool) -> Bool [hw]
+    if pin != 1 and pin != 2
+        return false
+    var reg = MD1_CFG
+    if pin == 2
+        reg = MD2_CFG
+    var v = 0
+    if on
+        v = MD_EMB_FUNC
+    lsm6dso.reg_update(p, reg, MD_EMB_FUNC, v)
+
+// ── Loading a configuration ──────────────────────────────────────────
+
+// Writes one entry of a configuration, `(address << 8) | value`: the plain
+// write of the part, with no read back, since the registers a file writes
+// include the page registers that do not read back what was written.
+// Whether the bus took it.
+pub fn conf_write<P: Lsm6dsoPort>(p: P, entry: Int) -> Bool [hw]
+    p.write_reg((entry >> 8) & 0xFF, entry & 0xFF)
+
+// Loads a configuration given as a list of register writes, each
+// `(address << 8) | value`, in order.  The file's own writes select the
+// banks (register 0x01) and the user bank is put back at the end, whether
+// the load finished or stopped.  Answers the number of writes made, or -1
+// when the bus refused one, or when the user bank could not be put back.
+//
+// The load changes the rates and the full scales of the sensors, the INT
+// routing and the embedded functions' enables to what the file says; it
+// follows `begin`.
+pub fn conf_load<P: Lsm6dsoPort>(p: P, writes: [Int]) -> Int [hw]
+    var done = 0
+    var ok = true
+    for w in writes
+        if ok
+            ok = conf_write(p, w)
+            if ok
+                done = done + 1
+    if not bank_leave(p, ok)
+        return -1
+    done
+
+// Loads a configuration from the text of a `.ucf` file, reading it where it
+// lies: the same as `conf_load` for the entries `ucf_next` finds.  Answers
+// the number of writes made, `-1` when the bus refused one or the user bank
+// could not be put back, and `-2` when a line of the text is none of the
+// three kinds a `.ucf` file has, in which case the writes before it were
+// made.  A device program has the text as a package asset; nothing is
+// allocated.
+pub fn conf_load_text<P: Lsm6dsoPort>(p: P, text: Str) -> Int [hw]
+    var pos = 0
+    var done = 0
+    var ok = true
+    var bad = false
+    for _i in 0..(str.len(text) + 1)
+        if ok and not bad
+            let e = lsm6dsox_ucf.ucf_next(text, var pos)
+            if e == lsm6dsox_ucf.UCF_BAD
+                bad = true
+            elif e >= 0
+                ok = conf_write(p, e)
+                if ok
+                    done = done + 1
+            else
+                break
+    if not bank_leave(p, ok)
+        return -1
+    if bad
+        return -2
+    done
+
+// ── The part, declared an LSM6DSOX, on an I2C bus ────────────────────
+
+// An LSM6DSO driver, declared by its owner to be an LSM6DSOX.  The two
+// parts answer alike, so this is the program's statement and not a check.
+pub @value
+struct Lsm6dsox
+    part: Lsm6dso
+
+impl Lsm6dsox
+    // The statement that `part` is an LSM6DSOX.  Nothing is sent.
+    fn declare(part: Lsm6dso) -> Lsm6dsox
+        Lsm6dsox { part: part }
+
+    // The configuration of a `.ucf` file, as a list of writes or as text.
+    fn load(self, writes: [Int]) -> Int [hw]
+        conf_load(self.part, writes)
+
+    fn load_text(self, text: Str) -> Int [hw]
+        conf_load_text(self.part, text)
+
+    // The decision trees: the output of one, of all eight, the changed
+    // flags, the on state, the rate and the interrupt routing.
+    fn mlc_output(self, n: Int) -> Int [hw]
+        mlc_out(self.part, n)
+
+    fn mlc_outputs(self, var dst: DevBytes) -> Bool [hw]
+        mlc_outs(self.part, var dst)
+
+    fn mlc_changed(self) -> Int [hw]
+        mlc_status(self.part)
+
+    fn mlc_on(self, on: Bool) -> Bool [hw]
+        mlc_enable(self.part, on)
+
+    fn mlc_is_on(self) -> ?Bool [hw]
+        mlc_enabled(self.part)
+
+    fn mlc_restart(self) -> Bool [hw]
+        mlc_init(self.part)
+
+    fn mlc_rate_mhz(self) -> Int [hw]
+        mlc_odr_read(self.part)
+
+    fn set_mlc_rate_mhz(self, mhz: Int) -> Int [hw]
+        mlc_odr_write(self.part, mhz)
+
+    fn route_mlc(self, pin: Int, mask: Int) -> Bool [hw]
+        mlc_route_int(self.part, pin, mask)
+
+    // The finite state machine, in the same way.
+    fn fsm_set_enabled(self, mask: Int) -> Bool [hw]
+        fsm_enable(self.part, mask)
+
+    fn fsm_enabled_mask(self) -> Int [hw]
+        fsm_enabled(self.part)
+
+    fn fsm_restart(self) -> Bool [hw]
+        fsm_init(self.part)
+
+    fn fsm_output(self, n: Int) -> Int [hw]
+        fsm_out(self.part, n)
+
+    fn fsm_outputs(self, var dst: DevBytes) -> Bool [hw]
+        fsm_outs(self.part, var dst)
+
+    fn fsm_changed(self) -> Int [hw]
+        fsm_status(self.part)
+
+    fn fsm_rate_mhz(self) -> Int [hw]
+        fsm_odr_read(self.part)
+
+    fn set_fsm_rate_mhz(self, mhz: Int) -> Int [hw]
+        fsm_odr_write(self.part, mhz)
+
+    fn route_fsm(self, pin: Int, mask: Int) -> Bool [hw]
+        fsm_route_int(self.part, pin, mask)
+
+    // The pin's bit for the embedded functions' interrupts.
+    fn set_emb_pin(self, pin: Int, on: Bool) -> Bool [hw]
+        emb_pin(self.part, pin, on)
+
+    // The register bank in use.
+    fn bank(self) -> Int [hw]
+        bank_get(self.part)
+
+// ── The part, declared an LSM6DSOX, on an SPI bus ────────────────────
+
+// An LSM6DSO driver on SPI, declared to be an LSM6DSOX.
+pub @value
+struct Lsm6dsoxSpi
+    part: Lsm6dsoSpi
+
+impl Lsm6dsoxSpi
+    fn declare(part: Lsm6dsoSpi) -> Lsm6dsoxSpi
+        Lsm6dsoxSpi { part: part }
+
+    fn load(self, writes: [Int]) -> Int [hw]
+        conf_load(self.part, writes)
+
+    fn load_text(self, text: Str) -> Int [hw]
+        conf_load_text(self.part, text)
+
+    fn mlc_output(self, n: Int) -> Int [hw]
+        mlc_out(self.part, n)
+
+    fn mlc_outputs(self, var dst: DevBytes) -> Bool [hw]
+        mlc_outs(self.part, var dst)
+
+    fn mlc_changed(self) -> Int [hw]
+        mlc_status(self.part)
+
+    fn mlc_on(self, on: Bool) -> Bool [hw]
+        mlc_enable(self.part, on)
+
+    fn mlc_is_on(self) -> ?Bool [hw]
+        mlc_enabled(self.part)
+
+    fn mlc_restart(self) -> Bool [hw]
+        mlc_init(self.part)
+
+    fn mlc_rate_mhz(self) -> Int [hw]
+        mlc_odr_read(self.part)
+
+    fn set_mlc_rate_mhz(self, mhz: Int) -> Int [hw]
+        mlc_odr_write(self.part, mhz)
+
+    fn route_mlc(self, pin: Int, mask: Int) -> Bool [hw]
+        mlc_route_int(self.part, pin, mask)
+
+    fn fsm_set_enabled(self, mask: Int) -> Bool [hw]
+        fsm_enable(self.part, mask)
+
+    fn fsm_enabled_mask(self) -> Int [hw]
+        fsm_enabled(self.part)
+
+    fn fsm_restart(self) -> Bool [hw]
+        fsm_init(self.part)
+
+    fn fsm_output(self, n: Int) -> Int [hw]
+        fsm_out(self.part, n)
+
+    fn fsm_outputs(self, var dst: DevBytes) -> Bool [hw]
+        fsm_outs(self.part, var dst)
+
+    fn fsm_changed(self) -> Int [hw]
+        fsm_status(self.part)
+
+    fn fsm_rate_mhz(self) -> Int [hw]
+        fsm_odr_read(self.part)
+
+    fn set_fsm_rate_mhz(self, mhz: Int) -> Int [hw]
+        fsm_odr_write(self.part, mhz)
+
+    fn route_fsm(self, pin: Int, mask: Int) -> Bool [hw]
+        fsm_route_int(self.part, pin, mask)
+
+    fn set_emb_pin(self, pin: Int, on: Bool) -> Bool [hw]
+        emb_pin(self.part, pin, on)
+
+    fn bank(self) -> Int [hw]
+        bank_get(self.part)

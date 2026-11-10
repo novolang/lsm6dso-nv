@@ -1,0 +1,254 @@
+// lsm6dsox_ucf — the `.ucf` text of ST's tools: a configuration for the
+// LSM6DSOX's machine learning core or finite state machine, as lines of
+// register writes.
+//
+// ST's Machine Learning Core tool, its Finite State Machine tool and
+// MEMS Studio write the configuration of a decision tree or of a program
+// as a `.ucf` file.  The files read for this reader are the ones in ST's
+// repository `STMicroelectronics/STMems_Machine_Learning_Core` (BSD 3-Clause
+// licence, 2019, discontinued in July 2025 in favour of
+// `st-mems-machine-learning-core`, whose files are JSON and C headers and
+// not `.ucf`).  A file is text, one line to a line:
+//
+//   -- Machine Learning Core Tool v9.13.0.0, LSM6DSOX     a comment
+//   -- <MLC0_SRC>DT1,0='Stationary',1='Walking'            a comment that names
+//                                                          the classes
+//   Ac 10 00                                               write 0x00 to 0x10
+//
+// A line is blank, a comment (`--` first among the non-blank bytes) or an
+// entry: `Ac`, a register address of two hexadecimal digits and a value of
+// two.  Upper or lower case, any run of spaces or tabs between the three
+// words, a carriage return before the line feed.  Nothing else is a line
+// in the files read, and the reader refuses anything else rather than
+// guess: another keyword is a format this reader has not been written for.
+//
+// An entry is the integer `(address << 8) | value`.  The scanner reads the
+// text where it lies, allocates nothing and counts its loops, so it runs on
+// a device when the text is a constant (a package asset, see
+// `docs/manifest.md`); `lsm6dsox_host` builds the list of entries for a
+// program on a computer.
+//
+// The class names are in the comment above the entries: `<MLCn_SRC>`, a
+// token such as `DT1`, and then `value='label'` pairs separated by commas.
+// `ucf_label_at` finds the label of an output value by its offset in the
+// text, and `ucf_label_len` its length, so a device program writes it a
+// byte at a time.
+
+// The answer of `ucf_next` at the end of the text.
+pub const UCF_END = -1
+
+// The answer of `ucf_next` for a line that is none of the three kinds.
+pub const UCF_BAD = -2
+
+// The byte at `i`, or -1 outside the text.
+fn at(text: Str, i: Int) -> Int
+    str.byte_at_or(text, i, -1)
+
+// The value of a hexadecimal digit, or -1.
+fn hex_of(c: Int) -> Int
+    if c >= 48 and c <= 57
+        return c - 48
+    if c >= 65 and c <= 70
+        return c - 55
+    if c >= 97 and c <= 102
+        return c - 87
+    -1
+
+// Whether `c` is a space, a tab or a carriage return.
+fn blank(c: Int) -> Bool
+    c == 32 or c == 9 or c == 13
+
+// The index of the first byte at or after `i` that is not a space, a tab
+// or a carriage return.
+fn skip_blank(text: Str, i: Int) -> Int
+    var j = i
+    for _k in 0..str.len(text)
+        if not blank(at(text, j))
+            break
+        j = j + 1
+    j
+
+// The index of the line feed that ends the line holding `i`, or the length
+// of the text.
+fn line_end(text: Str, i: Int) -> Int
+    let n = str.len(text)
+    var j = i
+    for _k in 0..n
+        if j >= n or at(text, j) == 10
+            break
+        j = j + 1
+    j
+
+// The byte that two hexadecimal digits at `i` spell, or -1.
+fn hex_byte(text: Str, i: Int) -> Int
+    let h = hex_of(at(text, i))
+    let l = hex_of(at(text, i + 1))
+    if h < 0 or l < 0
+        return -1
+    h * 16 + l
+
+// The entry of the line whose first word starts at `j`, or `UCF_BAD`.
+fn entry_at(text: Str, j: Int) -> Int
+    let a = at(text, j)
+    let b = at(text, j + 1)
+    if not ((a == 65 or a == 97) and (b == 67 or b == 99))
+        return UCF_BAD
+    let k = skip_blank(text, j + 2)
+    if k == j + 2
+        return UCF_BAD
+    let addr = hex_byte(text, k)
+    if addr < 0
+        return UCF_BAD
+    let m = skip_blank(text, k + 2)
+    if m == k + 2
+        return UCF_BAD
+    let data = hex_byte(text, m)
+    if data < 0
+        return UCF_BAD
+    let c = at(text, skip_blank(text, m + 2))
+    if c != 10 and c != -1
+        return UCF_BAD
+    addr * 256 + data
+
+// The next entry at or after the offset `pos`, which moves past its line:
+// the entry as `(address << 8) | value`, `UCF_END` when the text has no
+// more, `UCF_BAD` for a line that is none of the three kinds, in which case
+// `pos` is left at the start of that line.
+pub fn ucf_next(text: Str, var pos: Int) -> Int
+    let n = str.len(text)
+    var i = pos
+    var result = UCF_END
+    pos = n
+    for _line in 0..(n + 1)
+        let j = skip_blank(text, i)
+        let c = at(text, j)
+        if c == -1
+            break
+        if c == 10
+            i = j + 1
+        elif c == 45 and at(text, j + 1) == 45
+            i = line_end(text, j) + 1
+        else
+            let e = entry_at(text, j)
+            if e < 0
+                pos = i
+                result = UCF_BAD
+                break
+            let le = line_end(text, j)
+            if le < n
+                pos = le + 1
+            result = e
+            break
+    result
+
+// The number of entries in the text, or `UCF_BAD` when a line is none of
+// the three kinds.
+pub fn ucf_count(text: Str) -> Int
+    var pos = 0
+    var count = 0
+    for _i in 0..(str.len(text) + 1)
+        let e = ucf_next(text, var pos)
+        if e == UCF_END
+            break
+        if e == UCF_BAD
+            count = UCF_BAD
+            break
+        count = count + 1
+    count
+
+// The line number, from 1, of the offset `pos`.
+pub fn ucf_line_of(text: Str, pos: Int) -> Int
+    var line = 1
+    for i in 0..pos
+        if at(text, i) == 10
+            line = line + 1
+    line
+
+// The end of the run of decimal digits at `i`: `i` when there is none.
+fn dec_end(text: Str, i: Int) -> Int
+    var j = i
+    for _k in 0..str.len(text)
+        let c = at(text, j)
+        if c < 48 or c > 57
+            break
+        j = j + 1
+    j
+
+// The value of the decimal digits from `i` up to but not including `e`.
+fn dec_val(text: Str, i: Int, e: Int) -> Int
+    var v = 0
+    for k in i..e
+        v = v * 10 + (at(text, k) - 48)
+    v
+
+// Whether the bytes at `k` are `<MLCn_SRC>`.
+fn tag_is(text: Str, k: Int, tree: Int) -> Bool
+    at(text, k) == 60 and at(text, k + 1) == 77 and at(text, k + 2) == 76 and at(text, k + 3) == 67 and at(text, k + 4) == 48 + tree and at(text, k + 5) == 95 and at(text, k + 6) == 83 and at(text, k + 7) == 82 and at(text, k + 8) == 67 and at(text, k + 9) == 62
+
+// The offset of the label of the output value `v` in the pairs that follow
+// a tag, which run from `a` to the end of the line at `e`: the first byte
+// after the opening quote, or -1.
+fn label_in(text: Str, a: Int, e: Int, v: Int) -> Int
+    var i = a
+    for _k in 0..str.len(text)
+        if i >= e or at(text, i) == 44
+            break
+        i = i + 1
+    var found = -1
+    for _item in 0..(e - a + 1)
+        if i >= e
+            break
+        let ds = i + 1
+        let de = dec_end(text, ds)
+        if de == ds
+            break
+        if at(text, de) != 61 or at(text, de + 1) != 39
+            break
+        let ls = de + 2
+        var q = ls
+        for _k in 0..str.len(text)
+            if q >= e or at(text, q) == 39
+                break
+            q = q + 1
+        if q >= e
+            break
+        if dec_val(text, ds, de) == v
+            found = ls
+            break
+        i = q + 1
+        if i < e and at(text, i) != 44
+            break
+    found
+
+// The offset in `text` of the label that the comment of the tree `tree`
+// (0 to 7, the register MLC`tree`_SRC) gives to the output value `v`: the
+// first byte of the label, or -1 when the text has no comment for the tree
+// or the comment has no such value.  Only the first comment for the tree is
+// read.
+pub fn ucf_label_at(text: Str, tree: Int, v: Int) -> Int
+    var found = -1
+    if tree >= 0 and tree <= 7
+        let n = str.len(text)
+        var i = 0
+        for _line in 0..(n + 1)
+            let j = skip_blank(text, i)
+            if at(text, j) == -1
+                break
+            if at(text, j) == 45 and at(text, j + 1) == 45
+                let k = skip_blank(text, j + 2)
+                if tag_is(text, k, tree)
+                    found = label_in(text, k + 10, line_end(text, k), v)
+                    break
+            i = line_end(text, j) + 1
+    found
+
+// The length in bytes of the label that starts at `start`: up to the
+// closing quote, the end of the line or the end of the text.
+pub fn ucf_label_len(text: Str, start: Int) -> Int
+    var n = 0
+    for _k in 0..str.len(text)
+        let c = at(text, start + n)
+        if c == -1 or c == 39 or c == 10
+            break
+        n = n + 1
+    n

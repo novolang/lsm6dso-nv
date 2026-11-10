@@ -1,15 +1,21 @@
 [package]
 name        = "lsm6dso-nv"
 version     = "0.1.0"
-description = "A driver for ST's LSM6DSO six-axis inertial module on an I2C or an SPI bus: the acceleration in milli-g and the rate of turn in milli-degrees per second at the range and rate set, the output data rates and the high-performance and low-power modes, the data-ready pins, the FIFO in continuous mode as an option, the temperature, the self-tests and WHO_AM_I, as devices-nv's Accelerometer, Gyroscope, Imu, Thermometer and Identifiable."
+description = "A driver for ST's LSM6DSO six-axis inertial module on an I2C or an SPI bus: the acceleration in milli-g and the rate of turn in milli-degrees per second at the range and rate set, the output data rates and the high-performance and low-power modes, the data-ready pins, the FIFO in continuous mode as an option, the temperature, the self-tests and WHO_AM_I, as devices-nv's Accelerometer, Gyroscope, Imu, Thermometer and Identifiable; and, for the LSM6DSOX, the register banks, the machine learning core and the finite state machine, a loader for the configuration files of ST's tools (the register writes of a .ucf file) and a reader for the .ucf text."
 license     = "Apache-2.0"
 stability   = "experimental"
 category    = "embedded"
 layer       = "host"
-tags        = ["lsm6dso", "lsm6dsox", "imu", "accelerometer", "gyroscope", "i2c", "spi", "sensor", "nrf52840-dk", "nrf54lm20-dk"]
+tags        = ["lsm6dso", "lsm6dsox", "machine-learning-core", "finite-state-machine", "imu", "accelerometer", "gyroscope", "i2c", "spi", "sensor", "nrf52840-dk", "nrf54lm20-dk"]
 repository  = "https://github.com/novolang/lsm6dso-nv"
 maintainers = ["novo-lang"]
 novo        = ">= 0.24.0"
+
+# The package is checked at the embedded tier, the strictest one, so every
+# function in it is also valid at rt and system.  The module `lsm6dsox_host`
+# carries its own `@tier(app)`.
+[tier]
+tier = "embedded"
 
 [docs.pages]
 "README.md" = "Reading an LSM6DSO six-axis IMU from a device program"

@@ -44,11 +44,13 @@ struct Chip
     log: HashMap<Int, Int>
     fifo: HashMap<Int, Int>
 
+@tier(app)
 fn at(m: HashMap<Int, Int>, k: Int) -> Int
     m.get(k) ?? 0
 
 // The registers as a reset leaves them: WHO_AM_I, PIN_CTRL 0x3F, CTRL3_C
 // with IF_INC and CTRL9_XL with its DEN bits set, the rest 0.
+@tier(app)
 fn defaults(c: Chip)
     for r in 0..128
         c.regs.insert(r, 0)
@@ -58,6 +60,7 @@ fn defaults(c: Chip)
     c.regs.insert(0x18, 0xE0)
 
 // The chip with its reset values in place.
+@tier(app)
 fn chip() -> Chip
     let c = Chip { regs: HashMap.new(), st: HashMap.new(), ro: HashMap.new(), log: HashMap.new(), fifo: HashMap.new() }
     defaults(c)
@@ -67,6 +70,7 @@ fn chip() -> Chip
     c
 
 // Appends a value to the log, unless the test keeps none.
+@tier(app)
 fn log_push(c: Chip, v: Int)
     if at(c.st, 67) == 1
         return
@@ -75,25 +79,30 @@ fn log_push(c: Chip, v: Int)
     c.st.insert(99, n + 1)
 
 // Empties the log.
+@tier(app)
 fn log_clear(c: Chip)
     c.st.insert(99, 0)
 
 // Whether a multiple-byte transfer advances the address: IF_INC.
+@tier(app)
 fn inc_of(c: Chip) -> Int
     if (at(c.regs, 0x12) & 0x04) != 0
         return 1
     0
 
 // The FIFO is on in any mode but bypass.
+@tier(app)
 fn fifo_on(c: Chip) -> Bool
     (at(c.regs, 0x0A) & 0x07) != 0
 
 // The FIFO words that have not been taken.
+@tier(app)
 fn fifo_left(c: Chip) -> Int
     at(c.st, 98) / 7 - at(c.st, 10)
 
 // The self-test's push for a gyroscope or accelerometer axis: the part's
 // amount, positive or negative by the ST field of CTRL5_C.
+@tier(app)
 fn st_push(c: Chip, reg: Int) -> Int
     let c5 = at(c.regs, 0x14)
     if reg >= 0x28
@@ -114,6 +123,7 @@ fn st_push(c: Chip, reg: Int) -> Int
 
 // An output register 0x22 to 0x2D: the stored count plus the self-test's
 // push, one byte of it.  Reading clears the new-data flag of its sensor.
+@tier(app)
 fn out_read(c: Chip, reg: Int) -> Int
     if reg >= 0x28
         c.st.insert(41, 0)
@@ -126,6 +136,7 @@ fn out_read(c: Chip, reg: Int) -> Int
     (v >> 8) & 0xFF
 
 // STATUS_REG as the part answers it.
+@tier(app)
 fn status_read(c: Chip) -> Int
     if at(c.st, 43) == 1
         if at(c.st, 45) == 0
@@ -145,10 +156,12 @@ fn status_read(c: Chip) -> Int
 // Whether FUNC_CFG_ACCESS selects an embedded-function or sensor-hub
 // bank, in which the registers other than FUNC_CFG_ACCESS are other
 // registers (§ 9.1).  The double answers 0 for them and ignores writes.
+@tier(app)
 fn in_other_bank(c: Chip, reg: Int) -> Bool
     reg != 0x01 and (at(c.regs, 0x01) & 0xC0) != 0
 
 // A register as the part answers it.
+@tier(app)
 fn chip_read(c: Chip, reg: Int) -> Int
     if in_other_bank(c, reg)
         return 0
@@ -178,6 +191,7 @@ fn chip_read(c: Chip, reg: Int) -> Int
 
 // A write to a register, which a read-only one ignores.  SW_RESET puts the
 // registers back to their defaults; bypass mode empties the FIFO.
+@tier(app)
 fn chip_write(c: Chip, reg: Int, v: Int)
     if at(c.ro, reg) == 1 or in_other_bank(c, reg)
         return
@@ -194,9 +208,11 @@ struct FakeI2c
     c: Chip
 
 impl I2cBus for FakeI2c
+    @tier(app)
     fn init(self, freq: Int) [hw]
         self.c.st.insert(22, freq)
 
+    @tier(app)
     fn write(self, addr: Int, data: [u8]) -> Bool [hw]
         log_push(self.c, 1)
         log_push(self.c, addr)
@@ -212,9 +228,11 @@ impl I2cBus for FakeI2c
             r = r + inc
         true
 
+    @tier(app)
     fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
         None
 
+    @tier(app)
     fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
         log_push(self.c, 2)
         log_push(self.c, addr)
@@ -235,10 +253,12 @@ struct FakeSpi
     c: Chip
 
 impl SpiBus for FakeSpi
+    @tier(app)
     fn init(self, freq: Int, mode: Int) [hw]
         self.c.st.insert(20, freq)
         self.c.st.insert(21, mode)
 
+    @tier(app)
     fn transfer(self, b: Int) -> Int [hw]
         if at(self.c.st, 9) == 1
             log_push(self.c, b)
@@ -256,10 +276,12 @@ impl SpiBus for FakeSpi
         chip_write(self.c, r, b)
         0xFF
 
+    @tier(app)
     fn write(self, data: [u8]) [hw]
         for b in data
             let _ = self.transfer(b as Int)
 
+    @tier(app)
     fn read(self, n: Int) -> [u8] [hw]
         var out: [u8] = []
         for _i in 0..n
@@ -274,9 +296,11 @@ struct FakePins
     modes: HashMap<Int, Int>
 
 impl GpioOut for FakePins
+    @tier(app)
     fn mode(self, pin: Int, dir: Int) [hw]
         self.modes.insert(pin, dir)
 
+    @tier(app)
     fn set(self, pin: Int, val: Int) [hw]
         self.levels.insert(pin, val)
         if pin == 67 and val == 0
@@ -287,9 +311,11 @@ impl GpioOut for FakePins
             self.c.st.insert(9, 0)
             log_push(self.c, -1)
 
+    @tier(app)
     fn get(self, pin: Int) -> Int [hw]
         at(self.levels, pin)
 
+@tier(app)
 fn pins(c: Chip) -> FakePins
     FakePins { c: c, levels: HashMap.new(), modes: HashMap.new() }
 
@@ -301,18 +327,23 @@ struct I2cDut
     w: DeviceWiring
 
 impl Lsm6dsoPort for I2cDut
+    @tier(app)
     fn setup(self) -> Bool [hw]
         lsm6dso.i2c_setup(self.bus, self.pins, self.w)
 
+    @tier(app)
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         lsm6dso.i2c_read_into(self.bus, self.w, reg, n, var dst)
 
+    @tier(app)
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         lsm6dso.i2c_write(self.bus, self.w, reg, v)
 
+    @tier(app)
     fn irq_level(self) -> Int [hw]
         lsm6dso.irq_level_of(self.pins, self.w)
 
+    @tier(app)
     fn on_spi(self) -> Bool [hw]
         false
 
@@ -322,18 +353,23 @@ struct SpiDut
     w: DeviceWiring
 
 impl Lsm6dsoPort for SpiDut
+    @tier(app)
     fn setup(self) -> Bool [hw]
         lsm6dso.spi_setup(self.bus, self.pins, self.w)
 
+    @tier(app)
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         lsm6dso.spi_read_into(self.bus, self.pins, self.w, reg, n, var dst)
 
+    @tier(app)
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         lsm6dso.spi_write(self.bus, self.pins, self.w, reg, v)
 
+    @tier(app)
     fn irq_level(self) -> Int [hw]
         lsm6dso.irq_level_of(self.pins, self.w)
 
+    @tier(app)
     fn on_spi(self) -> Bool [hw]
         true
 
@@ -353,9 +389,11 @@ struct Flaky
     quiet: HashMap<Int, Int>
 
 impl Lsm6dsoPort for Flaky
+    @tier(app)
     fn setup(self) -> Bool [hw]
         self.inner.setup()
 
+    @tier(app)
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         let k = at(self.rseen, reg) + 1
         self.rseen.insert(reg, k)
@@ -369,6 +407,7 @@ impl Lsm6dsoPort for Flaky
             self.quiet.insert(0, at(self.quiet, 0) - 1)
         self.inner.read_regs(reg, n, var dst)
 
+    @tier(app)
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         let n = at(self.seen, reg) + 1
         self.seen.insert(reg, n)
@@ -376,61 +415,75 @@ impl Lsm6dsoPort for Flaky
             return false
         self.inner.write_reg(reg, v)
 
+    @tier(app)
     fn irq_level(self) -> Int [hw]
         self.inner.irq_level()
 
+    @tier(app)
     fn on_spi(self) -> Bool [hw]
         self.inner.on_spi()
 
+@tier(app)
 fn flaky(c: Chip) -> Flaky
     Flaky { inner: i2c_dut(c), fail: HashMap.new(), seen: HashMap.new(), rfail: HashMap.new(), rseen: HashMap.new(), quiet: HashMap.new() }
 
+@tier(app)
 fn flaky_write(c: Chip, reg: Int, nth: Int) -> Flaky
     let f = flaky(c)
     f.fail.insert(reg, nth)
     f
 
+@tier(app)
 fn flaky_read(c: Chip, reg: Int, nth: Int) -> Flaky
     let f = flaky(c)
     f.rfail.insert(reg, nth)
     f
 
 // The board's wiring: the part at 0x6A on I2C, INT1 on pin 65.
+@tier(app)
 fn i2c_wiring() -> DeviceWiring
     dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x6A), 65)
 
 // The part on SPI: chip select on pin 67, INT1 on pin 65.
+@tier(app)
 fn spi_wiring() -> DeviceWiring
     dev_bus.wiring_irq(dev_bus.wiring_spi(0, 67), 65)
 
+@tier(app)
 fn i2c_dut(c: Chip) -> I2cDut
     I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: i2c_wiring() }
 
+@tier(app)
 fn spi_dut(c: Chip) -> SpiDut
     SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: spi_wiring() }
 
 // Asserts the log holds exactly `want`, then empties it.
+@tier(app)
 fn log_is(c: Chip, want: [Int])
     test.assert_eq(at(c.st, 99), want.len())
     for i in 0..want.len()
         test.assert_eq(at(c.log, i), want[i])
     log_clear(c)
 
+@tier(app)
 fn reg_of(c: Chip, r: Int) -> Int
     at(c.regs, r)
 
 // Sets the 16-bit count of an axis, low byte first, at `reg`.
+@tier(app)
 fn put16(c: Chip, reg: Int, v: Int)
     let u = v & 0xFFFF
     c.regs.insert(reg, u & 0xFF)
     c.regs.insert(reg + 1, u >> 8)
 
 // Sets the gyroscope's three axes, then the accelerometer's.
+@tier(app)
 fn put_gyro(c: Chip, x: Int, y: Int, z: Int)
     put16(c, 0x22, x)
     put16(c, 0x24, y)
     put16(c, 0x26, z)
 
+@tier(app)
 fn put_accel(c: Chip, x: Int, y: Int, z: Int)
     put16(c, 0x28, x)
     put16(c, 0x2A, y)
@@ -438,6 +491,7 @@ fn put_accel(c: Chip, x: Int, y: Int, z: Int)
 
 // Appends a FIFO word: the sensor tag in the top five bits of the tag
 // byte, then three 16-bit counts.
+@tier(app)
 fn fifo_word(c: Chip, tag: Int, x: Int, y: Int, z: Int)
     let n = at(c.st, 98)
     c.fifo.insert(n, tag << 3)
@@ -449,31 +503,37 @@ fn fifo_word(c: Chip, tag: Int, x: Int, y: Int, z: Int)
         k = k + 2
     c.st.insert(98, n + 7)
 
+@tier(app)
 fn x_of(o: ?AccelMilliG) -> Int
     match o
         Some(a) => a.x
         None    => -99999
 
+@tier(app)
 fn y_of(o: ?AccelMilliG) -> Int
     match o
         Some(a) => a.y
         None    => -99999
 
+@tier(app)
 fn z_of(o: ?AccelMilliG) -> Int
     match o
         Some(a) => a.z
         None    => -99999
 
+@tier(app)
 fn gx_of(o: ?GyroMilliDps) -> Int
     match o
         Some(g) => g.x
         None    => -99999
 
+@tier(app)
 fn gy_of(o: ?GyroMilliDps) -> Int
     match o
         Some(g) => g.y
         None    => -99999
 
+@tier(app)
 fn gz_of(o: ?GyroMilliDps) -> Int
     match o
         Some(g) => g.z
@@ -481,6 +541,7 @@ fn gz_of(o: ?GyroMilliDps) -> Int
 
 // The log of an SPI read: the control byte, then `n` bytes of 0xFF, which
 // is what the controller clocks out while it reads.
+@tier(app)
 fn spi_read_log(cmd: Int, n: Int) -> [Int]
     var out: [Int] = [3, cmd]
     for _i in 0..n
@@ -1278,6 +1339,7 @@ fn test_a_list_that_is_full_stops_the_read_before_it_takes_a_word() [io, hw]
 
 // ── Self-tests ───────────────────────────────────────────────────────
 
+@tier(app)
 fn self_test_chip() -> Chip
     let c = chip()
     c.st.insert(43, 1)
@@ -1440,6 +1502,7 @@ fn test_the_self_test_windows_are_table_2s() [io, hw]
 
 // ── Bring-up ─────────────────────────────────────────────────────────
 
+@tier(app)
 fn stale_chip() -> Chip
     let c = chip()
     // What a previous run of the program, or another bank, could leave.
